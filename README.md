@@ -25,15 +25,17 @@ Open a fluorescence image and choose **Extensions → CI Denoise → Run Denoisi
   original intensities.
 - **Output** offers pyramidal OME-Zarr and OME-TIFF with float32 intensities,
   channel metadata and spatial calibration. The default folder is `cidenoise`
-  in the active project or next to the source image. You can open the first
-  result in the current viewer and add the exported images to the project.
-  Opening a result in a project also adds it to that project.
-  The project list refreshes as soon as the exports are imported.
+  in the active project or next to the source image. The project list refreshes
+  as soon as the exports are imported.
 - **Create max-Z projection** takes the maximum across the denoised slices,
   separately for each channel and time point. Unselected channels are
   projected from their original intensities. Turn this option off to keep
   all Z slices. Time frames are retained in both formats. Choose OME-Zarr if
   you need the time calibration exported by QuPath 0.7.0.
+- After a successful run, the results are added to the active project and the
+  first result opens in QuPath. Without a project, the first result opens directly.
+- Progress counts tiles while scanning intensities, denoising or copying channels,
+  and writing the OME-Zarr or OME-TIFF pyramid.
 - **Advanced settings** sets tile size and overlap. Defaults are 512 and 128
   pixels, as in CIDenoise. Normalization uses the maximum intensity per
   channel, Z slice and time point in the chosen region. Overlapping tile

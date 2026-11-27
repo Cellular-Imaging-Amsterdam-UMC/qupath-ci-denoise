@@ -54,8 +54,6 @@ final class CIDenoiseDialog {
     private final ComboBox<PathClass> annotationClass = new ComboBox<>();
     private final ComboBox<CIDenoise.Format> format = new ComboBox<>();
     private final CheckBox projection = new CheckBox("Create max-Z projection");
-    private final CheckBox open = new CheckBox("Open result after processing");
-    private final CheckBox add = new CheckBox("Add results to the project");
     private final TextField output;
     private final Spinner<Integer> tile;
     private final Spinner<Integer> overlap;
@@ -78,8 +76,7 @@ final class CIDenoiseDialog {
         }
     }
 
-    record Request(List<CIDenoise.Region> regions, Path directory, CIDenoise.Options options,
-                   boolean open, boolean add) {}
+    record Request(List<CIDenoise.Region> regions, Path directory, CIDenoise.Options options) {}
 
     CIDenoiseDialog(QuPathGUI qupath, ImageData<BufferedImage> data, Path directory) {
         this.qupath = qupath;
@@ -107,20 +104,6 @@ final class CIDenoiseDialog {
         format.setValue(PREFS.format.get());
         projection.setDisable(source.nZSlices() == 1);
         projection.setSelected(!projection.isDisabled() && PREFS.projection.get());
-        open.setSelected(PREFS.open.get());
-        open.setTooltip(new javafx.scene.control.Tooltip("Open the first result in the current QuPath viewer."));
-        add.setDisable(qupath.getProject() == null);
-        add.setSelected(!add.isDisabled() && PREFS.add.get());
-        if (qupath.getProject() != null) {
-            add.disableProperty().bind(open.selectedProperty());
-            add.setTooltip(new javafx.scene.control.Tooltip("QuPath adds images opened in a project to its image list."));
-            if (open.isSelected())
-                add.setSelected(true);
-            open.selectedProperty().addListener((obs, before, selected) -> {
-                if (selected)
-                    add.setSelected(true);
-            });
-        }
         tile = new Spinner<>(64, 512, PREFS.tile.get(), 32);
         overlap = new Spinner<>(0, tile.getValue() - 1, Math.min(PREFS.overlap.get(), tile.getValue() - 1), 16);
         tile.valueProperty().addListener((obs, oldValue, size) -> {
@@ -171,7 +154,7 @@ final class CIDenoiseDialog {
         var body = new VBox(9,
                 card("Image region", new HBox(8, mode, annotationClass)),
                 card("Channels", tiles),
-                card("Output", formats, folder, new HBox(12, open, add)),
+                card("Output", formats, folder),
                 advanced);
         body.getStyleClass().add("denoise-body");
         var scroll = new ScrollPane(body);
@@ -217,9 +200,6 @@ final class CIDenoiseDialog {
             PREFS.overlap.set(request.options().overlap());
             PREFS.device.set(request.options().device());
             PREFS.python.set(python.getText().strip());
-            PREFS.open.set(request.open());
-            if (!add.isDisabled())
-                PREFS.add.set(request.add());
         });
         return result;
     }
@@ -289,7 +269,7 @@ final class CIDenoiseDialog {
                 ? null : Path.of(python.getText().strip()).toAbsolutePath();
         var settings = new CIDenoise.Options(format.getValue(), projection.isSelected(),
                 tile.getValue(), overlap.getValue(), included, device.getValue(), pythonExecutable);
-        return new Request(List.copyOf(crops), directory, settings, open.isSelected(), add.isSelected());
+        return new Request(List.copyOf(crops), directory, settings);
     }
 
     private void chooseOutput() {
@@ -346,8 +326,6 @@ final class CIDenoiseDialog {
         private final javafx.beans.property.ObjectProperty<CIDenoise.Format> format =
                 PathPrefs.createPersistentPreference("ciDenoiseFormat", CIDenoise.Format.OME_ZARR, CIDenoise.Format.class);
         private final javafx.beans.property.BooleanProperty projection = PathPrefs.createPersistentPreference("ciDenoiseMaxZ", false);
-        private final javafx.beans.property.BooleanProperty open = PathPrefs.createPersistentPreference("ciDenoiseOpenResult", true);
-        private final javafx.beans.property.BooleanProperty add = PathPrefs.createPersistentPreference("ciDenoiseAddToProject", true);
         private final javafx.beans.property.IntegerProperty tile = PathPrefs.createPersistentPreference("ciDenoiseTile", CIDenoise.DEFAULT_TILE);
         private final javafx.beans.property.IntegerProperty overlap = PathPrefs.createPersistentPreference("ciDenoiseOverlap", CIDenoise.DEFAULT_OVERLAP);
         private final javafx.beans.property.ObjectProperty<CIDenoise.Device> device =

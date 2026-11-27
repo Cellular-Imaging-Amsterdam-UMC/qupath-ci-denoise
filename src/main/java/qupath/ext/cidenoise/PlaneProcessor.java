@@ -50,21 +50,43 @@ final class PlaneProcessor {
         rowBuffer = ByteBuffer.allocate(Math.multiplyExact(crop.width(), Float.BYTES));
     }
 
-    void process(int z, int t, int c) throws IOException {
+    @FunctionalInterface
+    interface TileProgress {
+        void update(String phase, long count, long total, long advance);
+    }
+
+    static boolean denoisesChannel(CIDenoise.Options options, int channel) {
+        return options.channels().isEmpty() || options.channels().contains(channel);
+    }
+
+    static long scanTiles(CIDenoise.Region crop, int tile) {
+        return (long) Math.ceilDiv(crop.width(), tile) * Math.ceilDiv(crop.height(), tile);
+    }
+
+    static long modelTiles(CIDenoise.Region crop, int tile, int overlap) {
+        int stride = tile - overlap;
+        return (1L + Math.ceilDiv(Math.max(0, crop.width() - tile), stride))
+                * (1L + Math.ceilDiv(Math.max(0, crop.height() - tile), stride));
+    }
+
+    void process(int z, int t, int c, TileProgress progress) throws IOException {
         CIDenoise.checkCancelled(cancelled);
-        if (!options.channels().isEmpty() && !options.channels().contains(c)) {
-            copyPlane(z, t, c);
+        if (!denoisesChannel(options, c)) {
+            copyPlane(z, t, c, progress);
             return;
         }
-        var range = range(z, t, c);
+        var range = range(z, t, c, progress);
+        long total = (long) rows.size() * columns.size();
         if (range.minimum == range.maximum) {
             for (int y = 0; y < crop.height(); y++) {
                 Arrays.fill(outputRow, range.minimum);
                 writeRow(y, z, t, c);
             }
+            progress.update("Constant channel · inference skipped", 0, 0, total);
             return;
         }
 
+        long done = 0;
         float scale = range.maximum > 0 ? range.maximum : 1;
         float low = Math.max(range.maximum, 0) * 0.5f;
         for (int band = 0; band < rows.size(); band++) {
@@ -89,6 +111,7 @@ final class PlaneProcessor {
                         row[x + i] += value * (ramp[j] * ramp[i]);
                     }
                 }
+                progress.update("Denoising", ++done, total, 1);
             }
 
             // Later tile rows cannot contribute to these scanlines.
@@ -104,7 +127,9 @@ final class PlaneProcessor {
         }
     }
 
-    private Range range(int z, int t, int c) throws IOException {
+    private Range range(int z, int t, int c, TileProgress progress) throws IOException {
+        long total = scanTiles(crop, tile);
+        long done = 0;
         float min = Float.POSITIVE_INFINITY;
         float max = Float.NEGATIVE_INFINITY;
         for (int y = 0; y < crop.height(); y += tile) {
@@ -118,12 +143,15 @@ final class PlaneProcessor {
                     min = Math.min(min, value);
                     max = Math.max(max, value);
                 }
+                progress.update("Scanning intensity", ++done, total, 1);
             }
         }
         return new Range(min, max);
     }
 
-    private void copyPlane(int z, int t, int c) throws IOException {
+    private void copyPlane(int z, int t, int c, TileProgress progress) throws IOException {
+        long total = scanTiles(crop, tile);
+        long done = 0;
         for (int y = 0; y < crop.height(); y += tile) {
             int height = Math.min(tile, crop.height() - y);
             for (int x = 0; x < crop.width(); x += tile) {
@@ -131,6 +159,7 @@ final class PlaneProcessor {
                 var samples = read(x, y, width, height, z, t, c);
                 for (int j = 0; j < height; j++)
                     System.arraycopy(samples, j * width, stripe[j], x, width);
+                progress.update("Copying", ++done, total, 1);
             }
             for (int j = 0; j < height; j++) {
                 System.arraycopy(stripe[j], 0, outputRow, 0, crop.width());

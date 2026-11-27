@@ -18,7 +18,6 @@ import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.commands.Commands;
 import qupath.lib.gui.dialogs.Dialogs;
 import qupath.lib.gui.extensions.QuPathExtension;
-import qupath.lib.gui.viewer.QuPathViewer;
 import qupath.lib.images.ImageData;
 import qupath.lib.images.servers.ImageServer;
 import qupath.lib.images.servers.ImageServers;
@@ -32,6 +31,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class CIDenoiseExtension implements QuPathExtension {
@@ -54,9 +54,8 @@ public final class CIDenoiseExtension implements QuPathExtension {
             if (data == null)
                 return;
             var project = qupath.getProject();
-            var viewer = qupath.getViewer();
             var dialog = new CIDenoiseDialog(qupath, data, defaultDirectory(data.getServer(), project));
-            dialog.show().ifPresent(request -> run(qupath, project, viewer, data, request));
+            dialog.show().ifPresent(request -> run(qupath, project, data, request));
         });
         var validate = new MenuItem("Validate Noise2Noise model");
         validate.disableProperty().bind(busy);
@@ -70,17 +69,23 @@ public final class CIDenoiseExtension implements QuPathExtension {
         menu.getItems().addAll(run, validate, new SeparatorMenuItem(), script, docs);
     }
 
-    private void run(QuPathGUI qupath, Project<BufferedImage> project, QuPathViewer viewer,
+    private void run(QuPathGUI qupath, Project<BufferedImage> project,
                      ImageData<BufferedImage> data, CIDenoiseDialog.Request request) {
         var sourceType = data.getImageType();
         var cancelled = new AtomicBoolean();
         var task = new Task<List<Path>>() {
+            private long lastUpdate;
+
             @Override
             protected List<Path> call() throws Exception {
                 return CIDenoise.run(data.getServer(), request.regions(), request.directory(), request.options(),
                         cancelled::get, (done, total, message) -> {
-                            updateMessage(message);
-                            updateProgress(done, total);
+                            long now = System.nanoTime();
+                            if (done == 0 || done == total || now - lastUpdate >= TimeUnit.MILLISECONDS.toNanos(25)) {
+                                lastUpdate = now;
+                                updateMessage(message);
+                                updateProgress(done, total);
+                            }
                         });
             }
         };
@@ -95,6 +100,7 @@ public final class CIDenoiseExtension implements QuPathExtension {
         pane.getButtonTypes().add(ButtonType.CANCEL);
         var status = new Label();
         status.setWrapText(true);
+        status.setMinHeight(56);
         status.textProperty().bind(task.messageProperty());
         var bar = new ProgressBar();
         bar.setMaxWidth(Double.MAX_VALUE);
@@ -130,7 +136,7 @@ public final class CIDenoiseExtension implements QuPathExtension {
         task.setOnSucceeded(event -> {
             finish.run();
             try {
-                presentResults(qupath, project, viewer, data, sourceType, request, task.getValue());
+                presentResults(qupath, project, sourceType, request.directory(), task.getValue());
             } finally {
                 busy.set(false);
             }
@@ -151,18 +157,17 @@ public final class CIDenoiseExtension implements QuPathExtension {
         qupath.getThreadPoolManager().getSingleThreadExecutor(this).submit(task);
     }
 
-    private void presentResults(QuPathGUI qupath, Project<BufferedImage> project, QuPathViewer sourceViewer,
-                                ImageData<BufferedImage> source, ImageData.ImageType sourceType,
-                                CIDenoiseDialog.Request request, List<Path> outputs) {
-        var saved = "Saved " + outputs.size() + (outputs.size() == 1 ? " image to " : " images to ") + request.directory();
-        if (qupath.getProject() != project && (request.add() || request.open())) {
+    private void presentResults(QuPathGUI qupath, Project<BufferedImage> project,
+                                ImageData.ImageType sourceType, Path directory, List<Path> outputs) {
+        var saved = "Saved " + outputs.size() + (outputs.size() == 1 ? " image to " : " images to ") + directory;
+        if (qupath.getProject() != project) {
             Dialogs.showWarningNotification(NAME, saved + ". The active project changed during processing.");
             return;
         }
 
-        ProjectImageEntry<BufferedImage> first = null;
         var warnings = new ArrayList<String>();
-        if (request.add()) {
+        ProjectImageEntry<BufferedImage> first = null;
+        if (project != null) {
             try {
                 first = addToProject(project, outputs, sourceType);
                 qupath.refreshProject();
@@ -171,18 +176,20 @@ public final class CIDenoiseExtension implements QuPathExtension {
                 warnings.add("Could not add the exports to the project.");
             }
         }
-        if (request.open()) {
-            if (qupath.getViewer() != sourceViewer || sourceViewer.getImageData() != source) {
-                warnings.add("The active image changed during processing.");
-            } else {
-                try {
-                    if (first != null) {
-                        if (!qupath.openImageEntry(first))
-                            warnings.add("Opening the result was cancelled.");
-                    } else if (project == null && (!source.isChanged() || Commands.promptToSaveImageData(qupath, source, true))) {
+        try {
+            if (first != null) {
+                if (!qupath.openImageEntry(first))
+                    warnings.add("Opening the result was cancelled.");
+            } else if (project == null) {
+                var viewer = qupath.getViewer();
+                if (viewer == null) {
+                    warnings.add("No active viewer to open the result.");
+                } else {
+                    var current = viewer.getImageData();
+                    if (current == null || !current.isChanged() || Commands.promptToSaveImageData(qupath, current, true)) {
                         var result = openOutput(outputs.getFirst(), sourceType);
                         try {
-                            sourceViewer.setImageData(result);
+                            viewer.setImageData(result);
                         } catch (Exception e) {
                             try {
                                 result.getServer().close();
@@ -191,12 +198,14 @@ public final class CIDenoiseExtension implements QuPathExtension {
                             }
                             throw e;
                         }
+                    } else {
+                        warnings.add("Opening the result was cancelled.");
                     }
-                } catch (Exception e) {
-                    logger.warn("Could not open the CI Denoise result", e);
-                    warnings.add("Could not open the first export in the viewer.");
                 }
             }
+        } catch (Exception e) {
+            logger.warn("Could not open the CI Denoise result", e);
+            warnings.add("Could not open the first export in the viewer.");
         }
         if (warnings.isEmpty())
             Dialogs.showInfoNotification(NAME, saved);

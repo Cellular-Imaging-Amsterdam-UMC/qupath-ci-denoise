@@ -28,6 +28,7 @@ import java.util.function.BooleanSupplier;
 public final class CIDenoise {
     public static final int DEFAULT_TILE = 512;
     public static final int DEFAULT_OVERLAP = 128;
+    private static final int EXPORT_TILE = 512;
     private static final Logger logger = LoggerFactory.getLogger(CIDenoise.class);
 
     private CIDenoise() {}
@@ -131,44 +132,41 @@ public final class CIDenoise {
             if (channel >= source.nChannels())
                 throw new IllegalArgumentException("Channel " + (channel + 1) + " is outside the source image.");
         }
-        long planes = (long)source.nTimepoints() * source.nZSlices() * source.nChannels();
-        long total = (planes + 1) * regions.size();
+        var plans = regions.stream().map(region -> plan(source, region, options)).toList();
+        var work = new RunProgress(plans.stream().mapToLong(RegionPlan::work).sum(), progress);
         Files.createDirectories(directory);
         var results = new java.util.ArrayList<Path>();
-        progress.update(0, total, "Loading Noise2Noise-FMD…");
+        work.advance(0, "Loading Noise2Noise-FMD…");
         try (var model = openModel(options.tileSize(), options.device(), options.pythonExecutable(), cancelled)) {
             logger.info("Noise2Noise-FMD inference on {}", model.deviceName());
             for (int index = 0; index < regions.size(); index++) {
                 checkCancelled(cancelled);
                 var region = regions.get(index);
+                var plan = plans.get(index);
                 String basename = safeName(region.name) + (options.maxZ ? "_denoise_maxZ" : "_denoise");
-                progress.update(index * (planes + 1), total, "Processing " + region.name);
                 var scratch = Files.createTempDirectory(directory, ".cidenoise-");
                 try {
-                    long initial = index * (planes + 1);
                     Path output;
                     try (var pixels = new DenoisedImageServer(scratch.resolve("pixels"), source, region,
                             options.maxZ, basename, cancelled)) {
                         var processor = new PlaneProcessor(source, region, options, model, pixels, cancelled);
-                        long done = initial;
                         for (int t = 0; t < source.nTimepoints(); t++) {
                             for (int z = 0; z < source.nZSlices(); z++) {
                                 for (int c = 0; c < source.nChannels(); c++) {
-                                    String status = String.format("%s (%d/%d)  •  T %d/%d  •  Z %d/%d  •  Channel %d/%d  •  %s",
+                                    String plane = String.format("%s (%d/%d)  •  T %d/%d  •  Z %d/%d  •  Channel %d/%d  •  %s%n",
                                             region.name, index + 1, regions.size(),
                                             t + 1, source.nTimepoints(), z + 1, source.nZSlices(), c + 1, source.nChannels(),
                                             model.deviceName());
-                                    progress.update(done++, total, status);
-                                    processor.process(z, t, c);
+                                    processor.process(z, t, c, (phase, count, total, advance) -> work.advance(advance,
+                                            plane + phase + (total == 0 ? "" : " tile " + count + " / " + total)));
                                 }
                             }
                         }
-                        progress.update(done, total, "Writing " + basename + options.format.suffix);
-                        output = publish(pixels, scratch, directory, basename, options.format(), cancelled);
+                        output = publish(pixels, scratch, directory, basename, options.format(), cancelled, plan, work);
                     }
                     results.add(output);
                     logger.info("Wrote {}", output);
-                    progress.update(initial + planes + 1, total, "Saved " + output.getFileName());
+                    work.advance(1, "Saved " + output.getFileName());
                 } finally {
                     deleteTemporaryFiles(scratch);
                 }
@@ -224,30 +222,106 @@ public final class CIDenoise {
             throw new CancellationException("Denoising cancelled.");
     }
 
-    private static void write(DenoisedImageServer pixels, Path target, Format format, BooleanSupplier cancelled)
-            throws Exception {
-        checkCancelled(cancelled);
-        // QuPath's writers publish channel metadata, physical pixel sizes and T/Z dimensions.
+    private record RegionPlan(double[] scales, long exportTiles, long work) {}
+
+    private static RegionPlan plan(ImageServer<?> source, Region region, Options options) {
         double[] scales = java.util.stream.IntStream.range(0, 16)
                 .mapToDouble(level -> Math.scalb(1.0, level))
-                .takeWhile(scale -> scale == 1 || Math.min(pixels.getWidth(), pixels.getHeight()) / (scale / 2) > 512)
+                .takeWhile(scale -> scale == 1 || Math.min(region.width(), region.height()) / (scale / 2) > EXPORT_TILE)
                 .toArray();
-        if (format == Format.OME_ZARR) {
-            new PyramidalOMEZarrWriter.Builder(pixels)
-                    .tileSize(512).downsamples(scales).parallelize(2)
-                    .onProgress(progress -> checkCancelled(cancelled))
-                    .build(target.toString()).writeImage();
-        } else {
-            var pyramid = scales.length == 1 ? pixels : ImageServers.pyramidalizeTiled(pixels, 512, 512, scales);
-            new OMEPyramidWriter.Builder(pyramid)
-                    .channelsPlanar().allZSlices().allTimePoints()
-                    .losslessCompression().tileSize(512).downsamples(scales)
-                    .build().writePyramid(target.toString());
+        long selectedChannels = java.util.stream.IntStream.range(0, source.nChannels())
+                .filter(channel -> PlaneProcessor.denoisesChannel(options, channel)).count();
+        long processing = (PlaneProcessor.scanTiles(region, options.tileSize()) * source.nChannels()
+                + PlaneProcessor.modelTiles(region, options.tileSize(), options.overlap()) * selectedChannels)
+                * source.nTimepoints() * source.nZSlices();
+        long exportTiles = Arrays.stream(scales)
+                .mapToLong(scale -> (long) Math.ceilDiv((int) (region.width() / scale), EXPORT_TILE)
+                        * Math.ceilDiv((int) (region.height() / scale), EXPORT_TILE))
+                .sum() * source.nTimepoints() * (options.maxZ() ? 1 : source.nZSlices());
+        if (options.format() == Format.OME_TIFF)
+            exportTiles *= source.nChannels();
+        return new RegionPlan(scales, exportTiles, processing + exportTiles + 1);
+    }
+
+    private static final class RunProgress {
+        private final long total;
+        private final Progress callback;
+        private long done;
+
+        private RunProgress(long total, Progress callback) {
+            this.total = total;
+            this.callback = callback;
+        }
+
+        synchronized void advance(long amount, String message) {
+            report(done + amount, message);
+        }
+
+        synchronized void report(long completed, String message) {
+            if (completed >= done) {
+                done = completed;
+                callback.update(done, total, message);
+            }
+        }
+
+        synchronized long completed() {
+            return done;
         }
     }
 
+    private static final class ExportProgress {
+        private final long start;
+        private final long total;
+        private final String heading;
+        private final RunProgress work;
+        private long completed;
+        private boolean finished;
+
+        private ExportProgress(long start, long total, String file, RunProgress work) {
+            this.start = start;
+            this.total = total;
+            this.heading = "Writing " + file;
+            this.work = work;
+            work.report(start, heading + "\nTile 0 / " + total);
+        }
+
+        synchronized void tile() {
+            if (!finished && completed < total) {
+                completed++;
+                work.report(start + completed, heading + "\nTile " + completed + " / " + total);
+            }
+        }
+
+        synchronized void finish() {
+            finished = true;
+            work.report(start + total, heading + "\nTile " + total + " / " + total + " · Finalizing…");
+        }
+    }
+
+    private static void write(DenoisedImageServer pixels, Path target, Format format, BooleanSupplier cancelled,
+                              double[] scales, ExportProgress progress) throws Exception {
+        checkCancelled(cancelled);
+        // QuPath's writers publish channel metadata, physical pixel sizes and T/Z dimensions.
+        if (format == Format.OME_ZARR) {
+            new PyramidalOMEZarrWriter.Builder(pixels)
+                    .tileSize(EXPORT_TILE).downsamples(scales).parallelize(2)
+                    .onProgress(fraction -> progress.tile())
+                    .build(target.toString()).writeImage();
+        } else {
+            var pyramid = scales.length == 1 ? pixels : ImageServers.pyramidalizeTiled(pixels, EXPORT_TILE, EXPORT_TILE, scales);
+            var counted = new TiffProgressServer(pyramid, progress::tile);
+            new OMEPyramidWriter.Builder(counted)
+                    .channelsPlanar().allZSlices().allTimePoints()
+                    .losslessCompression().tileSize(EXPORT_TILE).downsamples(scales)
+                    .build().writeSeries(target.toString());
+        }
+        checkCancelled(cancelled);
+        progress.finish();
+    }
+
     private static Path publish(DenoisedImageServer pixels, Path scratch, Path directory, String stem, Format format,
-                                BooleanSupplier cancelled) throws Exception {
+                                BooleanSupplier cancelled, RegionPlan plan, RunProgress progress) throws Exception {
+        long initial = progress.completed();
         for (int number = 1; ; number++) {
             checkCancelled(cancelled);
             String filename = stem + (number == 1 ? "" : "_" + number) + format.suffix;
@@ -256,7 +330,8 @@ public final class CIDenoise {
                 continue;
             // The OME-TIFF XML contains a file reference. Stage under the exact name that will be published.
             var staged = scratch.resolve(filename);
-            write(pixels, staged, format, cancelled);
+            write(pixels, staged, format, cancelled, plan.scales(),
+                    new ExportProgress(initial, plan.exportTiles(), filename, progress));
             try {
                 return moveCompletedExport(staged, candidate, cancelled);
             } catch (IOException e) {
