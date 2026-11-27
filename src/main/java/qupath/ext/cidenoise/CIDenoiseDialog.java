@@ -108,9 +108,19 @@ final class CIDenoiseDialog {
         projection.setDisable(source.nZSlices() == 1);
         projection.setSelected(!projection.isDisabled() && PREFS.projection.get());
         open.setSelected(PREFS.open.get());
-        open.setTooltip(new javafx.scene.control.Tooltip("Open the first result alongside the source in QuPath."));
+        open.setTooltip(new javafx.scene.control.Tooltip("Open the first result in the current QuPath viewer."));
         add.setDisable(qupath.getProject() == null);
         add.setSelected(!add.isDisabled() && PREFS.add.get());
+        if (qupath.getProject() != null) {
+            add.disableProperty().bind(open.selectedProperty());
+            add.setTooltip(new javafx.scene.control.Tooltip("QuPath adds images opened in a project to its image list."));
+            if (open.isSelected())
+                add.setSelected(true);
+            open.selectedProperty().addListener((obs, before, selected) -> {
+                if (selected)
+                    add.setSelected(true);
+            });
+        }
         tile = new Spinner<>(64, 512, PREFS.tile.get(), 32);
         overlap = new Spinner<>(0, tile.getValue() - 1, Math.min(PREFS.overlap.get(), tile.getValue() - 1), 16);
         tile.valueProperty().addListener((obs, oldValue, size) -> {

@@ -26,7 +26,8 @@ Open a fluorescence image and choose **Extensions → CI Denoise → Run Denoisi
 - **Output** offers pyramidal OME-Zarr and OME-TIFF with float32 intensities,
   channel metadata and spatial calibration. The default folder is `cidenoise`
   in the active project or next to the source image. You can open the first
-  result alongside the source and add the exported images to the project.
+  result in the current viewer and add the exported images to the project.
+  Opening a result in a project also adds it to that project.
   The project list refreshes as soon as the exports are imported.
 - **Create max-Z projection** takes the maximum across the denoised slices,
   separately for each channel and time point. Unselected channels are
