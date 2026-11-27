@@ -145,8 +145,8 @@ public final class CIDenoise {
                 progress.update(index * (planes + 1), total, "Processing " + region.name);
                 var scratch = Files.createTempDirectory(directory, ".cidenoise-");
                 try {
-                    var staged = scratch.resolve(basename + options.format.suffix);
                     long initial = index * (planes + 1);
+                    Path output;
                     try (var pixels = new DenoisedImageServer(scratch.resolve("pixels"), source, region,
                             options.maxZ, basename, cancelled)) {
                         var processor = new PlaneProcessor(source, region, options, model, pixels, cancelled);
@@ -164,10 +164,8 @@ public final class CIDenoise {
                             }
                         }
                         progress.update(done, total, "Writing " + basename + options.format.suffix);
-                        write(pixels, staged, options.format, cancelled);
+                        output = publish(pixels, scratch, directory, basename, options.format(), cancelled);
                     }
-                    checkCancelled(cancelled);
-                    var output = publish(staged, directory, basename, options.format.suffix, cancelled);
                     results.add(output);
                     logger.info("Wrote {}", output);
                     progress.update(initial + planes + 1, total, "Saved " + output.getFileName());
@@ -248,19 +246,24 @@ public final class CIDenoise {
         }
     }
 
-    private static Path publish(Path staged, Path directory, String stem, String suffix, BooleanSupplier cancelled)
-            throws IOException {
+    private static Path publish(DenoisedImageServer pixels, Path scratch, Path directory, String stem, Format format,
+                                BooleanSupplier cancelled) throws Exception {
         for (int number = 1; ; number++) {
             checkCancelled(cancelled);
-            var candidate = directory.resolve(stem + (number == 1 ? "" : "_" + number) + suffix);
+            String filename = stem + (number == 1 ? "" : "_" + number) + format.suffix;
+            var candidate = directory.resolve(filename);
             if (Files.exists(candidate, LinkOption.NOFOLLOW_LINKS))
                 continue;
+            // The OME-TIFF XML contains a file reference. Stage under the exact name that will be published.
+            var staged = scratch.resolve(filename);
+            write(pixels, staged, format, cancelled);
             try {
                 return moveCompletedExport(staged, candidate, cancelled);
             } catch (IOException e) {
                 // Another run can publish the same name after the existence check.
                 if (!(e instanceof FileAlreadyExistsException) && !Files.exists(candidate, LinkOption.NOFOLLOW_LINKS))
                     throw e;
+                deleteTemporaryFiles(staged);
             }
         }
     }
