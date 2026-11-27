@@ -1,0 +1,82 @@
+.ci-denoise {
+    -ci-denoise-surface: derive(-fx-background, 4%);
+    -ci-denoise-border: derive(-fx-background, -12%);
+    -ci-denoise-accent: #176d64;
+    -fx-background-color: -fx-background;
+    -fx-font-size: 13px;
+}
+
+.ci-denoise .denoise-header {
+    -fx-background-color: -ci-denoise-surface;
+    -fx-border-color: transparent transparent -ci-denoise-border transparent;
+    -fx-padding: 10 12;
+}
+
+.ci-denoise .denoise-title {
+    -fx-font-size: 20px;
+    -fx-font-weight: bold;
+}
+
+.ci-denoise .denoise-context {
+    -fx-font-size: 12px;
+}
+
+.ci-denoise .denoise-body {
+    -fx-padding: 9 11;
+}
+
+.ci-denoise.dialog-pane > .content {
+    -fx-padding: 0;
+}
+
+.ci-denoise .denoise-scroll,
+.ci-denoise .denoise-scroll > .viewport {
+    -fx-background-color: -fx-background;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
+
+.ci-denoise .denoise-scroll > .scroll-bar:vertical {
+    -fx-pref-width: 17px;
+}
+
+.ci-denoise .denoise-scroll .thumb {
+    -fx-background-color: ladder(-fx-background, #82969b 49%, #687d83 51%);
+    -fx-background-insets: 1 2;
+    -fx-background-radius: 6px;
+}
+
+.ci-denoise .denoise-card {
+    -fx-background-color: -ci-denoise-surface;
+    -fx-background-radius: 8px;
+    -fx-border-color: -ci-denoise-border;
+    -fx-border-radius: 8px;
+    -fx-padding: 9 11 10;
+}
+
+.ci-denoise .denoise-card-heading {
+    -fx-font-size: 15px;
+    -fx-font-weight: bold;
+}
+
+.ci-denoise.dialog-pane > .button-bar {
+    -fx-background-color: -ci-denoise-surface;
+    -fx-border-color: -ci-denoise-border transparent transparent transparent;
+}
+
+.ci-denoise .denoise-primary {
+    -fx-background-color: -ci-denoise-accent;
+    -fx-background-radius: 6px;
+    -fx-padding: 6 12;
+    -fx-text-fill: white;
+    -fx-font-weight: bold;
+}
+
+.ci-denoise .denoise-primary:hover {
+    -fx-background-color: #12584f;
+}
+
+.ci-denoise .denoise-primary:focused {
+    -fx-border-color: -fx-focus-color;
+    -fx-border-radius: 6px;
+}
