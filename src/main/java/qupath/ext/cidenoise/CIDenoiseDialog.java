@@ -19,6 +19,7 @@ import javafx.scene.control.TitledPane;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
 import javafx.scene.layout.TilePane;
 import javafx.scene.layout.VBox;
 import javafx.stage.DirectoryChooser;
@@ -41,7 +42,7 @@ import java.util.Comparator;
 import java.util.List;
 
 final class CIDenoiseDialog {
-    private static final ButtonType RUN = new ButtonType("Run denoising", ButtonBar.ButtonData.OK_DONE);
+    private static final ButtonType RUN = new ButtonType(CIDenoiseExtension.RUN_LABEL, ButtonBar.ButtonData.OK_DONE);
     private static final Preferences PREFS = new Preferences();
 
     private final QuPathGUI qupath;
@@ -107,12 +108,15 @@ final class CIDenoiseDialog {
         projection.setDisable(source.nZSlices() == 1);
         projection.setSelected(!projection.isDisabled() && PREFS.projection.get());
         open.setSelected(PREFS.open.get());
+        open.setTooltip(new javafx.scene.control.Tooltip("Open the first result alongside the source in QuPath."));
         add.setDisable(qupath.getProject() == null);
         add.setSelected(!add.isDisabled() && PREFS.add.get());
         tile = new Spinner<>(64, 512, PREFS.tile.get(), 32);
         overlap = new Spinner<>(0, tile.getValue() - 1, Math.min(PREFS.overlap.get(), tile.getValue() - 1), 16);
         tile.valueProperty().addListener((obs, oldValue, size) -> {
             var values = (javafx.scene.control.SpinnerValueFactory.IntegerSpinnerValueFactory)overlap.getValueFactory();
+            if (values.getValue() >= size)
+                values.setValue(size / 4);
             values.setMax(size - 1);
         });
         tile.setPrefWidth(90);
@@ -181,8 +185,10 @@ final class CIDenoiseDialog {
             refit.playFromStart();
         });
 
-        var run = pane.lookupButton(RUN);
+        var run = (Button)pane.lookupButton(RUN);
         run.getStyleClass().add("denoise-primary");
+        run.setMinWidth(Region.USE_PREF_SIZE);
+        ButtonBar.setButtonUniformSize(run, false);
         run.addEventFilter(javafx.event.ActionEvent.ACTION, event -> {
             try {
                 pane.setUserData(request());

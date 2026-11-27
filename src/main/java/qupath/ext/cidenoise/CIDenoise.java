@@ -11,9 +11,12 @@ import qupath.lib.roi.interfaces.ROI;
 
 import java.awt.image.BufferedImage;
 import java.io.IOException;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
@@ -164,7 +167,7 @@ public final class CIDenoise {
                         write(pixels, staged, options.format, cancelled);
                     }
                     checkCancelled(cancelled);
-                    var output = publish(staged, directory, basename, options.format.suffix);
+                    var output = publish(staged, directory, basename, options.format.suffix, cancelled);
                     results.add(output);
                     logger.info("Wrote {}", output);
                     progress.update(initial + planes + 1, total, "Saved " + output.getFileName());
@@ -245,13 +248,41 @@ public final class CIDenoise {
         }
     }
 
-    private static Path publish(Path staged, Path directory, String stem, String suffix) throws IOException {
+    private static Path publish(Path staged, Path directory, String stem, String suffix, BooleanSupplier cancelled)
+            throws IOException {
         for (int number = 1; ; number++) {
+            checkCancelled(cancelled);
             var candidate = directory.resolve(stem + (number == 1 ? "" : "_" + number) + suffix);
+            if (Files.exists(candidate, LinkOption.NOFOLLOW_LINKS))
+                continue;
+            try {
+                return moveCompletedExport(staged, candidate, cancelled);
+            } catch (IOException e) {
+                // Another run can publish the same name after the existence check.
+                if (!(e instanceof FileAlreadyExistsException) && !Files.exists(candidate, LinkOption.NOFOLLOW_LINKS))
+                    throw e;
+            }
+        }
+    }
+
+    private static Path moveCompletedExport(Path staged, Path candidate, BooleanSupplier cancelled) throws IOException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+        for (int delay = 50; ; delay = Math.min(400, delay * 2)) {
+            checkCancelled(cancelled);
             try {
                 return Files.move(staged, candidate);
-            } catch (FileAlreadyExistsException ignored) {
-                // Keep earlier results, including files produced by another running QuPath.
+            } catch (AccessDeniedException e) {
+                // Windows can temporarily lock a just-written OME-Zarr directory while its files are scanned.
+                if (Files.exists(candidate, LinkOption.NOFOLLOW_LINKS) || System.nanoTime() >= deadline)
+                    throw e;
+                if (delay == 50)
+                    logger.info("Waiting for temporary file access before publishing {}", candidate.getFileName());
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("Denoising cancelled.");
+                }
             }
         }
     }

@@ -16,7 +16,7 @@ Run **Extensions → CI Denoise → Validate Noise2Noise model** to check infere
 
 ## Run denoising
 
-Open a fluorescence image and choose **Extensions → CI Denoise → Run denoising…**.
+Open a fluorescence image and choose **Extensions → CI Denoise → Run Denoising**.
 
 - **Image region** offers the full image, selected area annotations, or all area
   annotations with a chosen class. Each annotation is exported as a rectangular
@@ -26,7 +26,8 @@ Open a fluorescence image and choose **Extensions → CI Denoise → Run denoisi
 - **Output** offers pyramidal OME-Zarr and OME-TIFF with float32 intensities,
   channel metadata and spatial calibration. The default folder is `cidenoise`
   in the active project or next to the source image. You can open the first
-  result in the viewer and add the exported images to the project.
+  result alongside the source and add the exported images to the project.
+  The project list refreshes as soon as the exports are imported.
 - **Create max-Z projection** takes the maximum across the denoised slices,
   separately for each channel and time point. Unselected channels are
   projected from their original intensities. Turn this option off to keep
@@ -43,7 +44,7 @@ Open a fluorescence image and choose **Extensions → CI Denoise → Run denoisi
   The progress window identifies the device used for inference.
 
 Results open with an assigned QuPath image type, and project entries use the
-exported filename. The source and earlier exports stay intact. The progress dialog supports
+exported filename. A numbered suffix distinguishes repeated exports. The progress dialog supports
 cancellation, and completed exports from the batch remain on disk.
 
 ## Groovy scripting

@@ -9,6 +9,7 @@ import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.SeparatorMenuItem;
+import javafx.scene.control.SplitPane;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
 import org.slf4j.Logger;
@@ -27,23 +28,31 @@ import qupath.lib.projects.ProjectImageEntry;
 import qupath.lib.projects.Projects;
 
 import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class CIDenoiseExtension implements QuPathExtension {
     static final String NAME = "CI Denoise";
+    static final String RUN_LABEL = "Run Denoising";
     private static final String DOCS = "https://github.com/Cellular-Imaging-Amsterdam-UMC/qupath-ci-denoise#readme";
     private static final Logger logger = LoggerFactory.getLogger(CIDenoiseExtension.class);
     private final SimpleBooleanProperty busy = new SimpleBooleanProperty();
+    private final WeakHashMap<ImageData<BufferedImage>, Comparison> comparisons = new WeakHashMap<>();
     private boolean installed;
+
+    private record Comparison(WeakReference<QuPathViewer> viewer, WeakReference<ImageData<BufferedImage>> result) {}
 
     @Override
     public void installExtension(QuPathGUI qupath) {
         if (installed)
             return;
         installed = true;
-        var run = new MenuItem("Run denoising…");
+        var run = new MenuItem(RUN_LABEL);
         run.disableProperty().bind(busy.or(qupath.imageDataProperty().isNull()));
         run.setOnAction(event -> {
             var data = qupath.getImageData();
@@ -122,33 +131,18 @@ public final class CIDenoiseExtension implements QuPathExtension {
         Runnable finish = () -> {
             progress.setOnCloseRequest(null);
             progress.close();
-            busy.set(false);
         };
         task.setOnSucceeded(event -> {
             finish.run();
-            var outputs = task.getValue();
-            boolean originalViewerUnchanged = qupath.getViewer() == viewer && qupath.getImageData() == data;
             try {
-                if (qupath.getProject() == project) {
-                    var first = request.add() ? addToProject(project, outputs, sourceType) : null;
-                    if (request.open() && originalViewerUnchanged) {
-                        if (first == null)
-                            viewer.setImageData(openOutput(outputs.getFirst(), sourceType));
-                        else if (!qupath.openImageEntry(first))
-                            throw new IllegalStateException("QuPath could not open the project image.");
-                    }
-                } else if (request.add()) {
-                    Dialogs.showWarningNotification(NAME, "The active project changed. Results were saved in " + request.directory());
-                    return;
-                }
-                Dialogs.showInfoNotification(NAME, "Saved " + outputs.size() + (outputs.size() == 1 ? " image to " : " images to ") + request.directory());
-            } catch (Exception e) {
-                logger.warn("Denoising outputs were written, but could not be imported or opened", e);
-                Dialogs.showWarningNotification(NAME, "Results were saved in " + request.directory() + ". " + e.getMessage());
+                presentResults(qupath, project, viewer, data, sourceType, request, task.getValue());
+            } finally {
+                busy.set(false);
             }
         });
         task.setOnFailed(event -> {
             finish.run();
+            busy.set(false);
             var error = task.getException();
             if (cancelled.get() || error instanceof java.util.concurrent.CancellationException) {
                 Dialogs.showInfoNotification(NAME, "Denoising cancelled. Completed exports are in " + request.directory());
@@ -162,6 +156,97 @@ public final class CIDenoiseExtension implements QuPathExtension {
         qupath.getThreadPoolManager().getSingleThreadExecutor(this).submit(task);
     }
 
+    private void presentResults(QuPathGUI qupath, Project<BufferedImage> project, QuPathViewer sourceViewer,
+                                ImageData<BufferedImage> source, ImageData.ImageType sourceType,
+                                CIDenoiseDialog.Request request, List<Path> outputs) {
+        var saved = "Saved " + outputs.size() + (outputs.size() == 1 ? " image to " : " images to ") + request.directory();
+        if (qupath.getProject() != project && (request.add() || request.open())) {
+            Dialogs.showWarningNotification(NAME, saved + ". The active project changed during processing.");
+            return;
+        }
+
+        ProjectImageEntry<BufferedImage> first = null;
+        var warnings = new ArrayList<String>();
+        if (request.add()) {
+            try {
+                first = addToProject(project, outputs, sourceType);
+                qupath.refreshProject();
+            } catch (Exception e) {
+                logger.warn("Could not add CI Denoise results to the project", e);
+                warnings.add("Could not add the exports to the project.");
+            }
+        }
+        if (request.open()) {
+            try {
+                var result = first == null ? openOutput(outputs.getFirst(), sourceType) : first.readImageData();
+                openAlongside(qupath, sourceViewer, source, result, first != null || project == null);
+            } catch (Exception e) {
+                logger.warn("Could not open the CI Denoise result", e);
+                warnings.add("Could not open the first export in the viewer.");
+            }
+        }
+        if (warnings.isEmpty())
+            Dialogs.showInfoNotification(NAME, saved);
+        else
+            Dialogs.showWarningNotification(NAME, saved + ". " + String.join(" ", warnings));
+    }
+
+    private void openAlongside(QuPathGUI qupath, QuPathViewer sourceViewer, ImageData<BufferedImage> source,
+                               ImageData<BufferedImage> result, boolean mayActivateResult) throws Exception {
+        var manager = qupath.getViewerManager();
+        boolean activateResult = mayActivateResult && manager.getActiveViewer() == sourceViewer
+                && sourceViewer.getImageData() == source;
+        QuPathViewer target;
+        try {
+            target = comparisonViewer(qupath, sourceViewer, source);
+            target.setImageData(result);
+        } catch (Exception e) {
+            try {
+                result.getServer().close();
+            } catch (Exception closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e;
+        }
+        comparisons.put(source, new Comparison(new WeakReference<>(target), new WeakReference<>(result)));
+        if (activateResult)
+            manager.setActiveViewer(target);
+    }
+
+    private QuPathViewer comparisonViewer(QuPathGUI qupath, QuPathViewer sourceViewer, ImageData<BufferedImage> source)
+            throws IOException {
+        var manager = qupath.getViewerManager();
+        var viewers = manager.getAllViewers();
+        var previous = comparisons.get(source);
+        if (previous != null) {
+            var viewer = previous.viewer().get();
+            if (viewer != null && viewer != sourceViewer && viewers.contains(viewer)) {
+                var current = viewer.getImageData();
+                if (current == null || (current == previous.result().get() && !current.isChanged()))
+                    return viewer;
+            }
+        }
+
+        // Select a slot in QuPath's grid. Detached or closed source viewers use the main grid.
+        var grid = (SplitPane)manager.getRegion();
+        var row = grid.getItems().stream().map(SplitPane.class::cast)
+                .filter(pane -> pane.getItems().contains(sourceViewer.getView())).findFirst()
+                .orElseGet(() -> (SplitPane)grid.getItems().getFirst());
+        var slots = row.getItems();
+        int next = slots.indexOf(sourceViewer.getView()) + 1;
+        if (next < slots.size()) {
+            var empty = viewers.stream().filter(v -> v.getView() == slots.get(next) && !v.hasServer()).findFirst();
+            if (empty.isPresent())
+                return empty.get();
+        }
+        var anchor = viewers.stream().filter(v -> v.getView() == slots.get(Math.max(0, next - 1))).findFirst()
+                .orElseThrow(() -> new IOException("QuPath has no available comparison viewer."));
+        manager.addColumn(anchor);
+        var addedSlot = slots.get(slots.indexOf(anchor.getView()) + 1);
+        return viewers.stream().filter(v -> v.getView() == addedSlot).findFirst()
+                .orElseThrow(() -> new IOException("QuPath could not create a comparison viewer."));
+    }
+
     private static ImageData<BufferedImage> openOutput(Path output, ImageData.ImageType sourceType)
             throws java.io.IOException {
         var server = ImageServers.buildServer(output.toUri());
@@ -173,7 +258,9 @@ public final class CIDenoiseExtension implements QuPathExtension {
                     server.isRGB() ? sourceType : ImageData.ImageType.OTHER;
             default -> sourceType;
         };
-        return new ImageData<>(server, outputType);
+        var data = new ImageData<>(server, outputType);
+        data.setChanged(false);
+        return data;
     }
 
     private static ProjectImageEntry<BufferedImage> addToProject(Project<BufferedImage> project, List<Path> outputs,
