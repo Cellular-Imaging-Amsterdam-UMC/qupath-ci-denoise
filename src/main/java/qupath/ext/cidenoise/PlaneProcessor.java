@@ -16,7 +16,7 @@ final class PlaneProcessor {
     private final ImageServer<BufferedImage> source;
     private final CIDenoise.Region crop;
     private final CIDenoise.Options options;
-    private final Noise2Noise model;
+    private final TilePredictor model;
     private final DenoisedImageServer output;
     private final BooleanSupplier cancelled;
     private final int tile;
@@ -31,7 +31,7 @@ final class PlaneProcessor {
     private final ByteBuffer rowBuffer;
 
     PlaneProcessor(ImageServer<BufferedImage> source, CIDenoise.Region crop, CIDenoise.Options options,
-                   Noise2Noise model, DenoisedImageServer output, BooleanSupplier cancelled) {
+                   TilePredictor model, DenoisedImageServer output, BooleanSupplier cancelled) {
         this.source = source;
         this.crop = crop;
         this.options = options;

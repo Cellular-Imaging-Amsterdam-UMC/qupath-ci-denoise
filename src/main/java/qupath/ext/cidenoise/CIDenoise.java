@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.lib.images.servers.ImageServer;
 import qupath.lib.images.servers.ImageServers;
+import qupath.lib.images.servers.ServerTools;
 import qupath.lib.images.writers.ome.OMEPyramidWriter;
 import qupath.lib.images.writers.ome.zarr.PyramidalOMEZarrWriter;
 import qupath.lib.roi.interfaces.ROI;
@@ -46,9 +47,30 @@ public final class CIDenoise {
         }
     }
 
-    public record Options(Format format, boolean maxZ, int tileSize, int overlap, List<Integer> channels) {
+    public enum Device {
+        AUTO("Auto"), CPU("CPU"), CUDA("NVIDIA CUDA");
+
+        private final String label;
+
+        Device(String label) {
+            this.label = label;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    public record Options(Format format, boolean maxZ, int tileSize, int overlap, List<Integer> channels,
+                          Device device, Path pythonExecutable) {
+        public Options(Format format, boolean maxZ, int tileSize, int overlap, List<Integer> channels) {
+            this(format, maxZ, tileSize, overlap, channels, Device.CPU, null);
+        }
+
         public Options {
             Objects.requireNonNull(format);
+            Objects.requireNonNull(device);
             channels = List.copyOf(channels);
             if (tileSize < 64 || tileSize > 512 || tileSize % 32 != 0 || overlap < 0 || overlap >= tileSize)
                 throw new IllegalArgumentException("Tile size must be a multiple of 32 from 64 to 512, with overlap smaller than the tile.");
@@ -69,7 +91,7 @@ public final class CIDenoise {
         }
 
         public static Region fullImage(ImageServer<?> source) {
-            return new Region(0, 0, source.getWidth(), source.getHeight(), source.getMetadata().getName());
+            return new Region(0, 0, source.getWidth(), source.getHeight(), sourceName(source));
         }
 
         /** Crop to the annotation's XY bounds and retain the source's full Z and T. */
@@ -110,7 +132,9 @@ public final class CIDenoise {
         long total = (planes + 1) * regions.size();
         Files.createDirectories(directory);
         var results = new java.util.ArrayList<Path>();
-        try (var model = new Noise2Noise(options.tileSize)) {
+        progress.update(0, total, "Loading Noise2Noise-FMD…");
+        try (var model = openModel(options.tileSize(), options.device(), options.pythonExecutable(), cancelled)) {
+            logger.info("Noise2Noise-FMD inference on {}", model.deviceName());
             for (int index = 0; index < regions.size(); index++) {
                 checkCancelled(cancelled);
                 var region = regions.get(index);
@@ -127,9 +151,10 @@ public final class CIDenoise {
                         for (int t = 0; t < source.nTimepoints(); t++) {
                             for (int z = 0; z < source.nZSlices(); z++) {
                                 for (int c = 0; c < source.nChannels(); c++) {
-                                    String status = String.format("%s (%d/%d)  •  T %d/%d  •  Z %d/%d  •  Channel %d/%d",
+                                    String status = String.format("%s (%d/%d)  •  T %d/%d  •  Z %d/%d  •  Channel %d/%d  •  %s",
                                             region.name, index + 1, regions.size(),
-                                            t + 1, source.nTimepoints(), z + 1, source.nZSlices(), c + 1, source.nChannels());
+                                            t + 1, source.nTimepoints(), z + 1, source.nZSlices(), c + 1, source.nChannels(),
+                                            model.deviceName());
                                     progress.update(done++, total, status);
                                     processor.process(z, t, c);
                                 }
@@ -152,7 +177,11 @@ public final class CIDenoise {
     }
 
     public static void validateModel() throws IOException {
-        try (var model = new Noise2Noise(64)) {
+        validateModel(Device.CPU, null);
+    }
+
+    public static String validateModel(Device device, Path pythonExecutable) throws IOException {
+        try (var model = openModel(64, device, pythonExecutable, () -> false)) {
             var pixels = new float[64 * 64];
             Arrays.fill(pixels, -0.25f);
             model.predict(pixels);
@@ -160,7 +189,33 @@ public final class CIDenoise {
                 if (!Float.isFinite(pixel))
                     throw new IOException("Noise2Noise-FMD returned non-finite values.");
             }
+            return model.deviceName();
         }
+    }
+
+    private static TilePredictor openModel(int tile, Device device, Path python, BooleanSupplier cancelled)
+            throws IOException {
+        if (device == Device.CPU)
+            return new Noise2Noise(tile);
+        if (python == null)
+            python = bundledPython();
+        if (python == null && device == Device.CUDA)
+            throw new IOException("Select a Python executable with CUDA-enabled PyTorch in Advanced settings.");
+        if (python != null) {
+            try {
+                return new CudaNoise2Noise(tile, python, cancelled);
+            } catch (IOException e) {
+                if (device == Device.CUDA)
+                    throw e;
+                logger.info("CUDA could not start. Using CPU for this run. {}", e.getMessage());
+            }
+        }
+        return new Noise2Noise(tile);
+    }
+
+    static Path bundledPython() {
+        String value = System.getenv("QUPATH_FULL_PYTHON");
+        return value == null || value.isBlank() ? null : Path.of(value);
     }
 
     static void checkCancelled(BooleanSupplier cancelled) {
@@ -209,7 +264,27 @@ public final class CIDenoise {
         return name.isBlank() ? "Image" : name.substring(0, Math.min(100, name.length()));
     }
 
-    private static void deleteTemporaryFiles(Path root) {
+    static boolean usableName(String name) {
+        return name != null && !name.isBlank() && !name.equalsIgnoreCase("Image null") && !name.equalsIgnoreCase("null");
+    }
+
+    static String sourceName(ImageServer<?> source) {
+        String name = ServerTools.getDisplayableImageName(source);
+        if (usableName(name))
+            return name;
+        for (var uri : source.getURIs()) {
+            String path = uri.getPath();
+            if (path != null && !path.isBlank()) {
+                name = path.replaceFirst("/+$", "");
+                name = name.substring(name.lastIndexOf('/') + 1);
+                if (usableName(name))
+                    return name;
+            }
+        }
+        return "Image";
+    }
+
+    static void deleteTemporaryFiles(Path root) {
         try (var paths = Files.walk(root)) {
             for (var path : paths.sorted(Comparator.reverseOrder()).toList())
                 Files.deleteIfExists(path);

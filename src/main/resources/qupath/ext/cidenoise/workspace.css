@@ -29,6 +29,10 @@
     -fx-padding: 0;
 }
 
+.ci-denoise.dialog-pane > .content.denoise-progress {
+    -fx-padding: 16 26 18;
+}
+
 .ci-denoise .denoise-scroll,
 .ci-denoise .denoise-scroll > .viewport {
     -fx-background-color: -fx-background;

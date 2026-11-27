@@ -12,7 +12,7 @@ import static org.bytedeco.opencv.global.opencv_dnn.DNN_TARGET_CPU;
 import static org.bytedeco.opencv.global.opencv_dnn.readNetFromONNX;
 
 /** One reusable CPU network and input blob per processing run. */
-final class Noise2Noise implements AutoCloseable {
+final class Noise2Noise implements TilePredictor {
     private final Net net;
     private final Mat input;
     private final int tile;
@@ -36,7 +36,13 @@ final class Noise2Noise implements AutoCloseable {
         }
     }
 
-    void predict(float[] pixels) throws IOException {
+    @Override
+    public String deviceName() {
+        return "CPU";
+    }
+
+    @Override
+    public void predict(float[] pixels) throws IOException {
         input.<FloatBuffer>createBuffer().put(pixels);
         net.setInput(input);
         try (var output = net.forward()) {

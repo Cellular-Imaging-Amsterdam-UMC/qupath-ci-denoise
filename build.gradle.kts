@@ -22,6 +22,7 @@ dependencies {
         compileOnly("io.github.qupath:qupath-gui-fx:0.7.0")
         compileOnly("io.github.qupath:qupath-extension-bioformats:0.7.0")
         compileOnly("org.bytedeco:opencv:4.11.0-1.5.12")
+        compileOnly("net.java.dev.jna:jna:5.17.0")
         compileOnly("org.slf4j:slf4j-api:2.0.17")
         // JavaFX classes are platform-independent. QuPath supplies its own native runtime.
         for (module in listOf("base", "graphics", "controls")) {

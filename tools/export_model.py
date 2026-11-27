@@ -1,4 +1,4 @@
-"""Rebuild the bundled ONNX model from the checksum-pinned FMD checkpoint."""
+"""Rebuild the ONNX and TorchScript models from the checksum-pinned FMD checkpoint."""
 
 import argparse
 import hashlib
@@ -34,6 +34,7 @@ def main():
         raise ValueError("The checkpoint SHA-256 does not match the published Noise2Noise-FMD weights")
 
     model = Noise2Noise().eval()
+    torch.set_num_threads(2)
     model.load_published(io.BytesIO(checkpoint))
     torch.onnx.export(
         model, (torch.zeros(1, 1, 64, 64),), OUTPUT,
@@ -41,6 +42,8 @@ def main():
         dynamic_axes={"input": {2: "height", 3: "width"}, "output": {2: "height", 3: "width"}},
     )
     onnx.checker.check_model(str(OUTPUT))
+    example = torch.zeros(1, 1, 64, 64)
+    torch.jit.trace(model, example).save(str(OUTPUT.with_suffix(".pt")))
 
 
 if __name__ == "__main__":

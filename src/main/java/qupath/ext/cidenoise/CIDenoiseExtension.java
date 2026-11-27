@@ -10,14 +10,18 @@ import javafx.scene.control.MenuItem;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.SeparatorMenuItem;
 import javafx.scene.layout.VBox;
+import javafx.stage.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.lib.common.Version;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.dialogs.Dialogs;
 import qupath.lib.gui.extensions.QuPathExtension;
+import qupath.lib.gui.viewer.QuPathViewer;
+import qupath.lib.images.ImageData;
 import qupath.lib.images.servers.ImageServer;
-import qupath.lib.images.servers.ImageServerProvider;
+import qupath.lib.images.servers.ImageServers;
+import qupath.lib.images.servers.ServerTools;
 import qupath.lib.projects.Project;
 import qupath.lib.projects.ProjectImageEntry;
 import qupath.lib.projects.Projects;
@@ -57,11 +61,14 @@ public final class CIDenoiseExtension implements QuPathExtension {
         script.setOnAction(event -> showScript(qupath));
         var docs = new MenuItem("Open documentation");
         docs.setOnAction(event -> QuPathGUI.openInBrowser(DOCS));
-        qupath.getMenu("Extensions>" + NAME, true).getItems().addAll(run, validate, new SeparatorMenuItem(), script, docs);
+        var menu = qupath.getMenu("Extensions>" + NAME, true);
+        menu.setGraphic(CIDenoiseIcons.view(16));
+        menu.getItems().addAll(run, validate, new SeparatorMenuItem(), script, docs);
     }
 
-    private void run(QuPathGUI qupath, Project<BufferedImage> project, qupath.lib.gui.viewer.QuPathViewer viewer,
-                     qupath.lib.images.ImageData<BufferedImage> data, CIDenoiseDialog.Request request) {
+    private void run(QuPathGUI qupath, Project<BufferedImage> project, QuPathViewer viewer,
+                     ImageData<BufferedImage> data, CIDenoiseDialog.Request request) {
+        var sourceType = data.getImageType();
         var cancelled = new AtomicBoolean();
         var task = new Task<List<Path>>() {
             @Override
@@ -89,9 +96,13 @@ public final class CIDenoiseExtension implements QuPathExtension {
         bar.setMaxWidth(Double.MAX_VALUE);
         bar.progressProperty().bind(task.progressProperty());
         var body = new VBox(8, status, bar);
-        body.getStyleClass().add("denoise-body");
+        body.getStyleClass().add("denoise-progress");
         body.setPrefWidth(560);
         pane.setContent(body);
+        progress.setOnShown(event -> {
+            if (pane.getScene().getWindow() instanceof Stage stage)
+                CIDenoiseIcons.apply(stage);
+        });
 
         Runnable requestCancel = () -> {
             cancelled.set(true);
@@ -119,12 +130,12 @@ public final class CIDenoiseExtension implements QuPathExtension {
             boolean originalViewerUnchanged = qupath.getViewer() == viewer && qupath.getImageData() == data;
             try {
                 if (qupath.getProject() == project) {
-                    var first = request.add() ? addToProject(project, outputs) : null;
+                    var first = request.add() ? addToProject(project, outputs, sourceType) : null;
                     if (request.open() && originalViewerUnchanged) {
-                        boolean opened = first == null ? qupath.openImage(viewer, outputs.getFirst().toUri().toString())
-                                : qupath.openImageEntry(first);
-                        if (!opened)
-                            throw new IllegalStateException("QuPath could not open the exported image.");
+                        if (first == null)
+                            viewer.setImageData(openOutput(outputs.getFirst(), sourceType));
+                        else if (!qupath.openImageEntry(first))
+                            throw new IllegalStateException("QuPath could not open the project image.");
                     }
                 } else if (request.add()) {
                     Dialogs.showWarningNotification(NAME, "The active project changed. Results were saved in " + request.directory());
@@ -148,16 +159,34 @@ public final class CIDenoiseExtension implements QuPathExtension {
         });
         busy.set(true);
         progress.show();
-        qupath.createSingleThreadExecutor(this).submit(task);
+        qupath.getThreadPoolManager().getSingleThreadExecutor(this).submit(task);
     }
 
-    private static ProjectImageEntry<BufferedImage> addToProject(Project<BufferedImage> project, List<Path> outputs)
-            throws Exception {
+    private static ImageData<BufferedImage> openOutput(Path output, ImageData.ImageType sourceType)
+            throws java.io.IOException {
+        var server = ImageServers.buildServer(output.toUri());
+        ServerTools.setImageName(server, output.getFileName().toString());
+        // QuPath only supports brightfield stain models for RGB images.
+        var outputType = switch (sourceType) {
+            case UNSET -> ImageData.ImageType.FLUORESCENCE;
+            case BRIGHTFIELD_H_DAB, BRIGHTFIELD_H_E, BRIGHTFIELD_OTHER ->
+                    server.isRGB() ? sourceType : ImageData.ImageType.OTHER;
+            default -> sourceType;
+        };
+        return new ImageData<>(server, outputType);
+    }
+
+    private static ProjectImageEntry<BufferedImage> addToProject(Project<BufferedImage> project, List<Path> outputs,
+                                                                ImageData.ImageType sourceType) throws Exception {
         var newEntries = new java.util.ArrayList<ProjectImageEntry<BufferedImage>>();
         try {
             for (Path output : outputs) {
-                try (var server = ImageServerProvider.buildServer(output.toUri().toString(), BufferedImage.class)) {
-                    newEntries.add(project.addImage(server.getBuilder()));
+                var data = openOutput(output, sourceType);
+                try (var server = data.getServer()) {
+                    var entry = project.addImage(server.getBuilder());
+                    newEntries.add(entry);
+                    entry.setImageName(output.getFileName().toString());
+                    entry.saveImageData(data);
                 }
             }
             project.syncChanges();
@@ -169,16 +198,15 @@ public final class CIDenoiseExtension implements QuPathExtension {
     }
 
     private void validate(QuPathGUI qupath) {
-        var task = new Task<Void>() {
+        var task = new Task<String>() {
             @Override
-            protected Void call() throws Exception {
-                CIDenoise.validateModel();
-                return null;
+            protected String call() throws Exception {
+                return CIDenoise.validateModel(CIDenoise.Device.AUTO, null);
             }
         };
         task.setOnSucceeded(event -> {
             busy.set(false);
-            Dialogs.showInfoNotification(NAME, "Noise2Noise-FMD passed the CPU inference check.");
+            Dialogs.showInfoNotification(NAME, "Noise2Noise-FMD passed on " + task.getValue() + ".");
         });
         task.setOnFailed(event -> {
             busy.set(false);
@@ -186,7 +214,7 @@ public final class CIDenoiseExtension implements QuPathExtension {
             Dialogs.showErrorMessage(NAME, task.getException());
         });
         busy.set(true);
-        qupath.createSingleThreadExecutor(this).submit(task);
+        qupath.getThreadPoolManager().getSingleThreadExecutor(this).submit(task);
     }
 
     private static Path defaultDirectory(ImageServer<BufferedImage> source, Project<BufferedImage> project) {
@@ -223,7 +251,8 @@ public final class CIDenoiseExtension implements QuPathExtension {
                 // An empty list denoises all channels. Use [0] for the first channel only.
                 // Set maxZ to true to project each restored Z stack after denoising.
                 def maxZ = false
-                def options = new CIDenoise.Options(CIDenoise.Format.OME_ZARR, maxZ, 512, 128, [])
+                def options = new CIDenoise.Options(CIDenoise.Format.OME_ZARR, maxZ, 512, 128, [],
+                        CIDenoise.Device.AUTO, null)
                 def base = PROJECT_BASE_DIR ?: System.getProperty('user.home')
                 def output = CIDenoise.run(source, region, Path.of(base, 'cidenoise'), options)
                 println output

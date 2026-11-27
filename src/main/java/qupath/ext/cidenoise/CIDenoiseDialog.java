@@ -1,6 +1,8 @@
 package qupath.ext.cidenoise;
 
+import javafx.animation.PauseTransition;
 import javafx.geometry.Pos;
+import javafx.util.Duration;
 import javafx.scene.Node;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonBar;
@@ -20,6 +22,8 @@ import javafx.scene.layout.Priority;
 import javafx.scene.layout.TilePane;
 import javafx.scene.layout.VBox;
 import javafx.stage.DirectoryChooser;
+import javafx.stage.Screen;
+import javafx.stage.Stage;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.dialogs.Dialogs;
 import qupath.lib.gui.prefs.PathPrefs;
@@ -41,8 +45,8 @@ final class CIDenoiseDialog {
     private static final Preferences PREFS = new Preferences();
 
     private final QuPathGUI qupath;
-    private final ImageData<BufferedImage> data;
     private final ImageServer<BufferedImage> source;
+    private final String sourceName;
     private final List<? extends PathObject> annotations;
     private final List<? extends PathObject> selected;
     private final ComboBox<RegionMode> mode = new ComboBox<>();
@@ -54,6 +58,8 @@ final class CIDenoiseDialog {
     private final TextField output;
     private final Spinner<Integer> tile;
     private final Spinner<Integer> overlap;
+    private final ComboBox<CIDenoise.Device> device = new ComboBox<>();
+    private final TextField python = new TextField();
     private final List<CheckBox> channels = new ArrayList<>();
 
     enum RegionMode {
@@ -76,8 +82,9 @@ final class CIDenoiseDialog {
 
     CIDenoiseDialog(QuPathGUI qupath, ImageData<BufferedImage> data, Path directory) {
         this.qupath = qupath;
-        this.data = data;
         source = data.getServer();
+        String displayed = qupath.getDisplayedImageName(data);
+        sourceName = CIDenoise.usableName(displayed) ? displayed : CIDenoise.sourceName(source);
         annotations = data.getHierarchy().getAnnotationObjects().stream().filter(CIDenoiseDialog::isArea).toList();
         selected = data.getHierarchy().getSelectionModel().getSelectedObjects().stream()
                 .filter(CIDenoiseDialog::isArea).toList();
@@ -110,6 +117,12 @@ final class CIDenoiseDialog {
         });
         tile.setPrefWidth(90);
         overlap.setPrefWidth(90);
+        device.getItems().setAll(CIDenoise.Device.values());
+        device.setValue(PREFS.device.get());
+        python.setText(PREFS.python.get());
+        python.setPromptText(CIDenoise.bundledPython() == null ? "Path to Python with CUDA-enabled PyTorch"
+                : "Use the Standalone Full Python runtime");
+        python.disableProperty().bind(device.valueProperty().isEqualTo(CIDenoise.Device.CPU));
         for (int c = 0; c < source.nChannels(); c++) {
             var box = new CheckBox((c + 1) + "  " + source.getChannel(c).getName());
             box.setSelected(true);
@@ -125,7 +138,7 @@ final class CIDenoiseDialog {
         var pane = dialog.getDialogPane();
         style(pane);
         pane.getButtonTypes().addAll(RUN, ButtonType.CANCEL);
-        pane.setHeader(header("CI Denoise", qupath.getDisplayedImageName(data) + "  •  Noise2Noise-FMD  •  CPU"));
+        pane.setHeader(header("CI Denoise", sourceName + "  •  Noise2Noise-FMD"));
 
         var tiles = new TilePane(14, 8);
         tiles.setPrefColumns(3);
@@ -139,6 +152,7 @@ final class CIDenoiseDialog {
         projection.setTooltip(new javafx.scene.control.Tooltip("Denoise Z slices individually, then project their maximum per channel and time point."));
 
         var advanced = new TitledPane("Advanced settings", advanced());
+        advanced.setAnimated(false);
         advanced.setExpanded(false);
         var body = new VBox(9,
                 card("Image region", new HBox(8, mode, annotationClass)),
@@ -148,10 +162,24 @@ final class CIDenoiseDialog {
         body.getStyleClass().add("denoise-body");
         var scroll = new ScrollPane(body);
         scroll.setFitToWidth(true);
-        scroll.setPrefViewportHeight(365);
         scroll.setPrefViewportWidth(600);
+        scroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
         scroll.getStyleClass().add("denoise-scroll");
         pane.setContent(scroll);
+        var refit = new PauseTransition(Duration.millis(100));
+        refit.setOnFinished(event -> fitSettingsWindow(scroll));
+        advanced.expandedProperty().addListener((obs, wasExpanded, expanded) -> refit.playFromStart());
+        dialog.setOnShowing(event -> {
+            if (pane.getScene().getWindow() instanceof Stage stage) {
+                stage.setMinWidth(530);
+                stage.setMinHeight(290);
+            }
+        });
+        dialog.setOnShown(event -> {
+            if (pane.getScene().getWindow() instanceof Stage stage)
+                CIDenoiseIcons.apply(stage);
+            refit.playFromStart();
+        });
 
         var run = pane.lookupButton(RUN);
         run.getStyleClass().add("denoise-primary");
@@ -171,6 +199,8 @@ final class CIDenoiseDialog {
                 PREFS.projection.set(request.options().maxZ());
             PREFS.tile.set(request.options().tileSize());
             PREFS.overlap.set(request.options().overlap());
+            PREFS.device.set(request.options().device());
+            PREFS.python.set(python.getText().strip());
             PREFS.open.set(request.open());
             if (!add.isDisabled())
                 PREFS.add.set(request.add());
@@ -178,21 +208,46 @@ final class CIDenoiseDialog {
         return result;
     }
 
+    private static void fitSettingsWindow(ScrollPane scroll) {
+        var scene = scroll.getScene();
+        if (scene == null || !(scene.getWindow() instanceof Stage stage) || !stage.isShowing() || stage.isMaximized())
+            return;
+        scene.getRoot().applyCss();
+        scene.getRoot().layout();
+        var viewport = scroll.getViewportBounds();
+        if (viewport.getWidth() <= 0 || viewport.getHeight() <= 0)
+            return;
+        var bounds = Screen.getScreensForRectangle(stage.getX() + stage.getWidth() / 2,
+                stage.getY() + stage.getHeight() / 2, 1, 1).stream().findFirst()
+                .orElse(Screen.getPrimary()).getVisualBounds();
+        double chrome = stage.getHeight() - viewport.getHeight();
+        double desired = Math.ceil(scroll.getContent().prefHeight(viewport.getWidth()) + chrome + 3);
+        double height = Math.clamp(desired, stage.getMinHeight(), Math.max(stage.getMinHeight(), bounds.getHeight()));
+        stage.setHeight(height);
+        stage.setY(Math.clamp(stage.getY(), bounds.getMinY(), Math.max(bounds.getMinY(), bounds.getMaxY() - height)));
+    }
+
     private Node advanced() {
         var grid = new GridPane();
         grid.setHgap(9);
+        grid.setVgap(8);
         grid.addRow(0, new Label("Tile size (px)"), tile, new Label("Overlap (px)"), overlap);
+        grid.addRow(1, new Label("Device"), device);
+        grid.add(new Label("Python executable"), 0, 2);
+        grid.add(python, 1, 2, 3, 1);
+        GridPane.setHgrow(python, Priority.ALWAYS);
+        device.setTooltip(new javafx.scene.control.Tooltip("Auto uses NVIDIA CUDA when available and falls back to CPU."));
         return grid;
     }
 
     private Request request() {
         var crops = new ArrayList<CIDenoise.Region>();
         if (mode.getValue() == RegionMode.FULL) {
-            crops.add(CIDenoise.Region.fullImage(source));
+            crops.add(new CIDenoise.Region(0, 0, source.getWidth(), source.getHeight(), sourceName));
         } else {
             var objects = mode.getValue() == RegionMode.SELECTED ? selected : annotations.stream()
                     .filter(object -> annotationClass.getValue().equals(object.getPathClass())).toList();
-            String image = CIDenoise.safeName(source.getMetadata().getName());
+            String image = CIDenoise.safeName(sourceName);
             for (var object : objects) {
                 String label = object.getName();
                 if (label == null || label.isBlank())
@@ -214,8 +269,10 @@ final class CIDenoiseDialog {
         var directory = Path.of(output.getText().strip()).toAbsolutePath().normalize();
         if (Files.exists(directory) && !Files.isDirectory(directory))
             throw new IllegalArgumentException("The output path must be a folder.");
+        var pythonExecutable = device.getValue() == CIDenoise.Device.CPU || python.getText().isBlank()
+                ? null : Path.of(python.getText().strip()).toAbsolutePath();
         var settings = new CIDenoise.Options(format.getValue(), projection.isSelected(),
-                tile.getValue(), overlap.getValue(), included);
+                tile.getValue(), overlap.getValue(), included, device.getValue(), pythonExecutable);
         return new Request(List.copyOf(crops), directory, settings, open.isSelected(), add.isSelected());
     }
 
@@ -246,15 +303,18 @@ final class CIDenoiseDialog {
         pane.getStylesheets().add(CIDenoiseDialog.class.getResource("workspace.css").toExternalForm());
     }
 
-    static VBox header(String title, String context) {
+    static HBox header(String title, String context) {
         var label = new Label(title);
         label.getStyleClass().add("denoise-title");
         var subtitle = new Label(context);
         subtitle.setWrapText(true);
         subtitle.getStyleClass().add("denoise-context");
         var box = new VBox(4, label, subtitle);
-        box.getStyleClass().add("denoise-header");
-        return box;
+        HBox.setHgrow(box, Priority.ALWAYS);
+        var header = new HBox(10, CIDenoiseIcons.view(32), box);
+        header.setAlignment(Pos.CENTER_LEFT);
+        header.getStyleClass().add("denoise-header");
+        return header;
     }
 
     private static VBox card(String title, Node... content) {
@@ -274,5 +334,8 @@ final class CIDenoiseDialog {
         private final javafx.beans.property.BooleanProperty add = PathPrefs.createPersistentPreference("ciDenoiseAddToProject", true);
         private final javafx.beans.property.IntegerProperty tile = PathPrefs.createPersistentPreference("ciDenoiseTile", CIDenoise.DEFAULT_TILE);
         private final javafx.beans.property.IntegerProperty overlap = PathPrefs.createPersistentPreference("ciDenoiseOverlap", CIDenoise.DEFAULT_OVERLAP);
+        private final javafx.beans.property.ObjectProperty<CIDenoise.Device> device =
+                PathPrefs.createPersistentPreference("ciDenoiseDevice", CIDenoise.Device.AUTO, CIDenoise.Device.class);
+        private final javafx.beans.property.StringProperty python = PathPrefs.createPersistentPreference("ciDenoisePython", "");
     }
 }
