@@ -42,7 +42,7 @@ final class Noise2Noise implements TilePredictor {
     }
 
     @Override
-    public void predict(float[] pixels) throws IOException {
+    public void predict(float[] pixels, int channel) throws IOException {
         input.<FloatBuffer>createBuffer().put(pixels);
         net.setInput(input);
         try (var output = net.forward()) {

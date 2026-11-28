@@ -4,7 +4,7 @@ Denoise fluorescence microscopy images in QuPath 0.7.0 with the fast
 **Noise2Noise-FMD** model from [CIDenoise](https://github.com/Cellular-Imaging-Amsterdam-UMC/cidenoise).
 The extension includes the model and runs offline. It supports the OpenCV CPU
 runtime supplied with QuPath and NVIDIA CUDA through a CUDA-enabled PyTorch
-environment.
+environment. **FluoResFM** adds text-conditioned deconvolution on the same pixel grid.
 
 ## Installation
 
@@ -21,8 +21,12 @@ Open a fluorescence image and choose **Extensions → CI Denoise → Run Denoisi
 - **Image region** offers the full image, selected area annotations, or all area
   annotations with a chosen class. Each annotation is exported as a rectangular
   crop around its XY bounds, with the full Z and T extent.
-- **Channels** controls which channels are denoised. Unselected channels use the
+- **Channels** controls which channels are restored. Unselected channels use the
   original intensities.
+- **Model** selects Noise2Noise-FMD or **FluoResFM (deconvolution)**.
+  **Denoising strength** defaults to 100% each time the dialog opens. At 0%
+  the exporter copies the original pixels. Intermediate values blend restored
+  and original intensities before export or max-Z projection.
 - **Output** offers pyramidal OME-Zarr and OME-TIFF with float32 intensities,
   channel metadata and spatial calibration. The default folder is `cidenoise`
   in the active project or next to the source image. The project list refreshes
@@ -49,6 +53,29 @@ Open a fluorescence image and choose **Extensions → CI Denoise → Run Denoisi
 Results open with an assigned QuPath image type, and project entries use the
 exported filename. A numbered suffix distinguishes repeated exports. The progress dialog supports
 cancellation, and completed exports from the batch remain on disk.
+
+## FluoResFM setup
+
+FluoResFM uses NVIDIA CUDA and needs PyTorch and Transformers in the selected
+Python environment. Standalone Full supplies this Python runtime. The optional
+weights and tokenizer take about 3.5 GB. Download them into the Standalone Full
+folder (or into a separate folder selected under **Model**):
+
+```powershell
+python tools/fetch_fluoresfm.py "C:\path\to\QuPath7-StandAlone-Full\models\fluoresfm"
+```
+
+The script uses the authors' published checkpoint and Microsoft's BiomedCLIP
+text assets. Use a different model directory with **Browse…** or
+`QUPATH_FLUORESFM_MODELS`. You can enter **Image context** to describe the
+microscope and structure in English. The extension adds the channel name when
+informative and the calibrated pixel size when available.
+
+FluoResFM applies 2D deconvolution to each selected channel, Z slice and time
+point. It uses 64-pixel tiles with 16 pixels of overlap and approximates the
+published intensity percentiles across the whole input plane. Output is
+mapped back to the input intensity scale. Files use the `_fluoresfm` suffix.
+You can also select an existing denoised image as input.
 
 ## Groovy scripting
 

@@ -96,7 +96,9 @@ public final class CIDenoiseExtension implements QuPathExtension {
         progress.initModality(javafx.stage.Modality.NONE);
         var pane = progress.getDialogPane();
         CIDenoiseDialog.style(pane);
-        pane.setHeader(CIDenoiseDialog.header("CI Denoise", "Running Noise2Noise-FMD"));
+        String context = request.options().strength() == 0 ? "Copying original pixels"
+                : "Running " + request.options().model() + "  •  " + request.options().strength() + "% strength";
+        pane.setHeader(CIDenoiseDialog.header("CI Denoise", context));
         pane.getButtonTypes().add(ButtonType.CANCEL);
         var status = new Label();
         status.setWrapText(true);
@@ -319,7 +321,7 @@ public final class CIDenoiseExtension implements QuPathExtension {
 
     @Override
     public String getDescription() {
-        return "Denoise fluorescence microscopy images with the bundled Noise2Noise-FMD model.";
+        return "Restore fluorescence microscopy images using Noise2Noise-FMD or FluoResFM.";
     }
 
     @Override

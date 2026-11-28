@@ -13,6 +13,8 @@ import javafx.scene.control.Dialog;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
+import javafx.scene.control.Slider;
+import javafx.scene.control.Tooltip;
 import javafx.scene.control.Spinner;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TitledPane;
@@ -53,6 +55,10 @@ final class CIDenoiseDialog {
     private final ComboBox<RegionMode> mode = new ComboBox<>();
     private final ComboBox<PathClass> annotationClass = new ComboBox<>();
     private final ComboBox<CIDenoise.Format> format = new ComboBox<>();
+    private final ComboBox<CIDenoise.Model> model = new ComboBox<>();
+    private final Slider strength = new Slider(0, 100, 100);
+    private final TextField fluoFolder = new TextField();
+    private final TextField imageContext = new TextField();
     private final CheckBox projection = new CheckBox("Create max-Z projection");
     private final TextField output;
     private final Spinner<Integer> tile;
@@ -116,10 +122,31 @@ final class CIDenoiseDialog {
         overlap.setPrefWidth(90);
         device.getItems().setAll(CIDenoise.Device.values());
         device.setValue(PREFS.device.get());
+        model.getItems().setAll(CIDenoise.Model.values());
+        model.setValue(PREFS.model.get());
+        var bundledModels = CIDenoise.bundledFluoResFM();
+        String savedFolder = PREFS.fluoFolder.get();
+        fluoFolder.setText(savedFolder.isBlank() && bundledModels != null ? bundledModels.toString() : savedFolder);
+        fluoFolder.setPromptText("Folder containing the weights and tokenizer");
+        imageContext.setPromptText("Optional microscope and structure, e.g. confocal; nuclei");
+        imageContext.setAccessibleText("Image context for FluoResFM");
+        fluoFolder.setAccessibleText("FluoResFM model folder");
+        strength.setId("ci-denoise-strength");
+        strength.setAccessibleText("Denoising strength");
+        strength.setBlockIncrement(5);
+        strength.setTooltip(new Tooltip("0% preserves the original pixels. 100% uses the full model output."));
         python.setText(PREFS.python.get());
         python.setPromptText(CIDenoise.bundledPython() == null ? "Path to Python with CUDA-enabled PyTorch"
                 : "Use the Standalone Full Python runtime");
-        python.disableProperty().bind(device.valueProperty().isEqualTo(CIDenoise.Device.CPU));
+        var fluo = model.valueProperty().isEqualTo(CIDenoise.Model.FLUORESFM);
+        device.disableProperty().bind(fluo);
+        tile.disableProperty().bind(fluo);
+        overlap.disableProperty().bind(fluo);
+        python.disableProperty().bind(fluo.not().and(device.valueProperty().isEqualTo(CIDenoise.Device.CPU)));
+        model.valueProperty().addListener((obs, before, after) ->
+                device.setValue(after == CIDenoise.Model.FLUORESFM ? CIDenoise.Device.CUDA : PREFS.device.get()));
+        if (fluo.get())
+            device.setValue(CIDenoise.Device.CUDA);
         for (int c = 0; c < source.nChannels(); c++) {
             var box = new CheckBox((c + 1) + "  " + source.getChannel(c).getName());
             box.setSelected(true);
@@ -135,13 +162,13 @@ final class CIDenoiseDialog {
         var pane = dialog.getDialogPane();
         style(pane);
         pane.getButtonTypes().addAll(RUN, ButtonType.CANCEL);
-        pane.setHeader(header("CI Denoise", sourceName + "  •  Noise2Noise-FMD"));
+        pane.setHeader(header("CI Denoise", sourceName));
 
         var tiles = new TilePane(14, 8);
         tiles.setPrefColumns(3);
         tiles.getChildren().setAll(channels);
         var browse = new Button("Browse…");
-        browse.setOnAction(event -> chooseOutput());
+        browse.setOnAction(event -> chooseDirectory(output, "Choose output folder"));
         HBox.setHgrow(output, Priority.ALWAYS);
         var folder = new HBox(8, output, browse);
         var formats = new HBox(12, format, projection);
@@ -154,6 +181,7 @@ final class CIDenoiseDialog {
         var body = new VBox(9,
                 card("Image region", new HBox(8, mode, annotationClass)),
                 card("Channels", tiles),
+                modelCard(),
                 card("Output", formats, folder),
                 advanced);
         body.getStyleClass().add("denoise-body");
@@ -166,6 +194,7 @@ final class CIDenoiseDialog {
         var refit = new PauseTransition(Duration.millis(100));
         refit.setOnFinished(event -> fitSettingsWindow(scroll));
         advanced.expandedProperty().addListener((obs, wasExpanded, expanded) -> refit.playFromStart());
+        model.valueProperty().addListener((obs, before, after) -> refit.playFromStart());
         dialog.setOnShowing(event -> {
             if (pane.getScene().getWindow() instanceof Stage stage) {
                 stage.setMinWidth(530);
@@ -196,9 +225,14 @@ final class CIDenoiseDialog {
             PREFS.format.set(request.options().format());
             if (!projection.isDisabled())
                 PREFS.projection.set(request.options().maxZ());
-            PREFS.tile.set(request.options().tileSize());
-            PREFS.overlap.set(request.options().overlap());
-            PREFS.device.set(request.options().device());
+            PREFS.model.set(request.options().model());
+            if (request.options().model() == CIDenoise.Model.NOISE2NOISE_FMD) {
+                PREFS.tile.set(request.options().tileSize());
+                PREFS.overlap.set(request.options().overlap());
+                PREFS.device.set(request.options().device());
+            } else {
+                PREFS.fluoFolder.set(fluoFolder.getText().strip());
+            }
             PREFS.python.set(python.getText().strip());
         });
         return result;
@@ -223,6 +257,28 @@ final class CIDenoiseDialog {
         stage.setY(Math.clamp(stage.getY(), bounds.getMinY(), Math.max(bounds.getMinY(), bounds.getMaxY() - height)));
     }
 
+    private Node modelCard() {
+        model.setId("ci-denoise-model");
+        model.setAccessibleText("Restoration model");
+        var strengthLabel = new Label();
+        strengthLabel.setMinWidth(46);
+        strengthLabel.setAlignment(Pos.CENTER_RIGHT);
+        strengthLabel.textProperty().bind(strength.valueProperty().asString("%.0f%%"));
+        strength.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(strength, Priority.ALWAYS);
+        var controls = new HBox(8, new Label("Denoising strength"), strength, strengthLabel);
+        controls.setAlignment(Pos.CENTER_LEFT);
+
+        var browse = new Button("Browse…");
+        browse.setOnAction(event -> chooseDirectory(fluoFolder, "Choose FluoResFM model folder"));
+        HBox.setHgrow(fluoFolder, Priority.ALWAYS);
+        var directory = new HBox(8, fluoFolder, browse);
+        var extra = new VBox(7, directory, imageContext);
+        extra.visibleProperty().bind(model.valueProperty().isEqualTo(CIDenoise.Model.FLUORESFM));
+        extra.managedProperty().bind(extra.visibleProperty());
+        return card("Model", model, controls, extra);
+    }
+
     private Node advanced() {
         var grid = new GridPane();
         grid.setHgap(9);
@@ -232,7 +288,13 @@ final class CIDenoiseDialog {
         grid.add(new Label("Python executable"), 0, 2);
         grid.add(python, 1, 2, 3, 1);
         GridPane.setHgrow(python, Priority.ALWAYS);
-        device.setTooltip(new javafx.scene.control.Tooltip("Auto uses NVIDIA CUDA when available and falls back to CPU."));
+        var fluo = model.valueProperty().isEqualTo(CIDenoise.Model.FLUORESFM);
+        var note = new Label("FluoResFM uses NVIDIA CUDA and 64-pixel tiles with 16 pixels of overlap.");
+        note.setWrapText(true);
+        note.visibleProperty().bind(fluo);
+        note.managedProperty().bind(note.visibleProperty());
+        grid.add(note, 0, 3, 4, 1);
+        device.setTooltip(new Tooltip("Noise2Noise-FMD Auto uses NVIDIA CUDA when available and falls back to CPU."));
         return grid;
     }
 
@@ -267,16 +329,29 @@ final class CIDenoiseDialog {
             throw new IllegalArgumentException("The output path must be a folder.");
         var pythonExecutable = device.getValue() == CIDenoise.Device.CPU || python.getText().isBlank()
                 ? null : Path.of(python.getText().strip()).toAbsolutePath();
+        var selectedModel = model.getValue();
+        int amount = (int) Math.round(strength.getValue());
+        boolean fluo = selectedModel == CIDenoise.Model.FLUORESFM;
+        CIDenoise.FluoResFMSettings fluoSettings = null;
+        if (fluo && amount > 0) {
+            if (fluoFolder.getText().isBlank())
+                throw new IllegalArgumentException("Choose a FluoResFM model folder.");
+            var weights = Path.of(fluoFolder.getText().strip()).toAbsolutePath().normalize();
+            CIDenoise.validateFluoResFMFolder(weights);
+            fluoSettings = new CIDenoise.FluoResFMSettings(weights, imageContext.getText().strip());
+        }
         var settings = new CIDenoise.Options(format.getValue(), projection.isSelected(),
-                tile.getValue(), overlap.getValue(), included, device.getValue(), pythonExecutable);
+                fluo ? CIDenoise.FLUORESFM_TILE : tile.getValue(),
+                fluo ? CIDenoise.FLUORESFM_OVERLAP : overlap.getValue(),
+                included, device.getValue(), pythonExecutable, selectedModel, amount, fluoSettings);
         return new Request(List.copyOf(crops), directory, settings);
     }
 
-    private void chooseOutput() {
+    private void chooseDirectory(TextField field, String title) {
         var chooser = new DirectoryChooser();
-        chooser.setTitle("Choose output folder");
+        chooser.setTitle(title);
         try {
-            Path initial = Path.of(output.getText()).toAbsolutePath();
+            Path initial = Path.of(field.getText()).toAbsolutePath();
             while (initial != null && !Files.isDirectory(initial))
                 initial = initial.getParent();
             if (initial != null)
@@ -284,9 +359,9 @@ final class CIDenoiseDialog {
         } catch (InvalidPathException ignored) {
             // The chooser can still open with its default starting location.
         }
-        var folder = chooser.showDialog(qupath.getStage());
+        var folder = chooser.showDialog(field.getScene().getWindow());
         if (folder != null)
-            output.setText(folder.getAbsolutePath());
+            field.setText(folder.getAbsolutePath());
     }
 
     private static boolean isArea(PathObject object) {
@@ -330,6 +405,10 @@ final class CIDenoiseDialog {
         private final javafx.beans.property.IntegerProperty overlap = PathPrefs.createPersistentPreference("ciDenoiseOverlap", CIDenoise.DEFAULT_OVERLAP);
         private final javafx.beans.property.ObjectProperty<CIDenoise.Device> device =
                 PathPrefs.createPersistentPreference("ciDenoiseDevice", CIDenoise.Device.AUTO, CIDenoise.Device.class);
+        private final javafx.beans.property.ObjectProperty<CIDenoise.Model> model =
+                PathPrefs.createPersistentPreference("ciDenoiseModel", CIDenoise.Model.NOISE2NOISE_FMD, CIDenoise.Model.class);
+        private final javafx.beans.property.StringProperty fluoFolder =
+                PathPrefs.createPersistentPreference("ciDenoiseFluoResFMFolder", "");
         private final javafx.beans.property.StringProperty python = PathPrefs.createPersistentPreference("ciDenoisePython", "");
     }
 }

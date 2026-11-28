@@ -1,5 +1,7 @@
 package qupath.ext.cidenoise;
 
+import qupath.lib.io.GsonTools;
+
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -9,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -16,12 +20,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
 
-/** Reuses the bundled PyTorch CUDA runtime for a whole run, one binary tile at a time. */
-final class CudaNoise2Noise implements TilePredictor {
+/** Runs a persistent PyTorch worker and exchanges one binary tile per request. */
+final class PythonTilePredictor implements TilePredictor {
     private static final Duration START_TIMEOUT = Duration.ofMinutes(2);
     private static final Duration TILE_TIMEOUT = Duration.ofMinutes(2);
-    private static final String SCRIPT = "cuda_worker.py";
-    private static final String MODEL = "noise2noise-fmd.pt";
+    private static final String NOISE_SCRIPT = "cuda_worker.py";
+    private static final String NOISE_WEIGHTS = "noise2noise-fmd.pt";
+    private static final String FLUORESFM_SCRIPT = "fluoresfm_worker.py";
 
     private final Path directory;
     private final Path stderr;
@@ -29,20 +34,46 @@ final class CudaNoise2Noise implements TilePredictor {
     private final java.util.concurrent.ExecutorService executor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("cidenoise-cuda-io").factory());
     private final ByteBuffer buffer;
+    private final ByteBuffer channelHeader;
+    private final String modelName;
     private Process process;
     private String deviceName;
 
-    CudaNoise2Noise(int tile, Path python, BooleanSupplier cancelled) throws IOException {
+    static PythonTilePredictor noise2Noise(int tile, Path python, BooleanSupplier cancelled) throws IOException {
+        return new PythonTilePredictor(tile, python, null, List.of(), cancelled);
+    }
+
+    static PythonTilePredictor fluoResFM(int tile, Path python, Path weights, List<String> prompts,
+                                        BooleanSupplier cancelled) throws IOException {
+        return new PythonTilePredictor(tile, python, weights, prompts, cancelled);
+    }
+
+    private PythonTilePredictor(int tile, Path python, Path weights, List<String> prompts,
+                                BooleanSupplier cancelled) throws IOException {
         this.cancelled = cancelled;
+        boolean fluo = weights != null;
+        modelName = fluo ? "FluoResFM" : "Noise2Noise-FMD";
         buffer = ByteBuffer.allocate(tile * tile * Float.BYTES).order(ByteOrder.nativeOrder());
+        channelHeader = fluo ? ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN) : null;
         directory = Files.createTempDirectory("cidenoise-cuda-");
         stderr = directory.resolve("stderr.log");
         try {
-            copyResource(SCRIPT);
-            copyResource(MODEL);
-            var builder = new ProcessBuilder(python.toAbsolutePath().toString(), "-I", "-u",
-                    directory.resolve(SCRIPT).toString(), directory.resolve(MODEL).toString(), Integer.toString(tile))
-                    .directory(directory.toFile()).redirectError(stderr.toFile());
+            var command = new ArrayList<>(List.of(python.toAbsolutePath().toString(), "-I", "-u"));
+            if (fluo) {
+                copyResource(FLUORESFM_SCRIPT);
+                copyResource("fluoresfm_unet.py");
+                copyResource("fluoresfm_attention.py");
+                Path promptPath = directory.resolve("prompts.json");
+                Files.writeString(promptPath, GsonTools.getInstance().toJson(prompts), StandardCharsets.UTF_8);
+                command.addAll(List.of(directory.resolve(FLUORESFM_SCRIPT).toString(),
+                        weights.toAbsolutePath().toString(), Integer.toString(tile), promptPath.toString()));
+            } else {
+                copyResource(NOISE_SCRIPT);
+                copyResource(NOISE_WEIGHTS);
+                command.addAll(List.of(directory.resolve(NOISE_SCRIPT).toString(),
+                        directory.resolve(NOISE_WEIGHTS).toString(), Integer.toString(tile)));
+            }
+            var builder = new ProcessBuilder(command).directory(directory.toFile()).redirectError(stderr.toFile());
             // Conda on Windows keeps additional native dependencies in Library/bin.
             var bin = python.toAbsolutePath().getParent().resolve("Library").resolve("bin");
             if (Files.isDirectory(bin)) {
@@ -51,7 +82,7 @@ final class CudaNoise2Noise implements TilePredictor {
                 env.put(pathKey, bin + File.pathSeparator + env.getOrDefault(pathKey, ""));
             }
             process = builder.start();
-            deviceName = "CUDA (" + await(this::readDevice, START_TIMEOUT) + ")";
+            deviceName = "CUDA (" + await(this::readDevice, fluo ? Duration.ofMinutes(5) : START_TIMEOUT) + ")";
         } catch (IOException | RuntimeException e) {
             close();
             throw e;
@@ -59,9 +90,9 @@ final class CudaNoise2Noise implements TilePredictor {
     }
 
     private void copyResource(String name) throws IOException {
-        try (var input = CudaNoise2Noise.class.getResourceAsStream(name)) {
+        try (var input = PythonTilePredictor.class.getResourceAsStream(name)) {
             if (input == null)
-                throw new IOException("Missing bundled Noise2Noise-FMD resource " + name);
+                throw new IOException("Missing bundled model resource " + name);
             Files.copy(input, directory.resolve(name));
         }
     }
@@ -83,10 +114,14 @@ final class CudaNoise2Noise implements TilePredictor {
     }
 
     @Override
-    public void predict(float[] pixels) throws IOException {
+    public void predict(float[] pixels, int channel) throws IOException {
         buffer.asFloatBuffer().put(pixels);
         await(() -> {
             var input = process.getOutputStream();
+            if (channelHeader != null) {
+                channelHeader.putInt(0, channel);
+                input.write(channelHeader.array());
+            }
             input.write(buffer.array());
             input.flush();
             var output = process.getInputStream();
@@ -104,7 +139,7 @@ final class CudaNoise2Noise implements TilePredictor {
             while (true) {
                 CIDenoise.checkCancelled(cancelled);
                 if (System.nanoTime() >= deadline)
-                    throw new IOException("Noise2Noise-FMD CUDA worker timed out.");
+                    throw new IOException(modelName + " CUDA worker timed out.");
                 try {
                     return pending.get(200, TimeUnit.MILLISECONDS);
                 } catch (TimeoutException ignored) {
@@ -120,7 +155,7 @@ final class CudaNoise2Noise implements TilePredictor {
                 if (!details.isEmpty())
                     throw new IOException(details, e.getCause());
             }
-            throw new IOException("Noise2Noise-FMD CUDA failed: " + e.getCause().getMessage(), e.getCause());
+            throw new IOException(modelName + " CUDA failed: " + e.getCause().getMessage(), e.getCause());
         } finally {
             pending.cancel(true);
         }

@@ -4,7 +4,7 @@ import java.io.IOException;
 
 interface TilePredictor extends AutoCloseable {
     String deviceName();
-    void predict(float[] pixels) throws IOException;
+    void predict(float[] pixels, int channel) throws IOException;
     @Override
     void close();
 }

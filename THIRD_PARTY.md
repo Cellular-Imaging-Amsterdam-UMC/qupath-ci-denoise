@@ -11,3 +11,10 @@
 - The JavaFX workspace stylesheet and Windows caption icon integration are adapted from CI Deconvolve for QuPath,
   © 2024–2025 Cellular Imaging, Amsterdam UMC (MIT).
   See `licenses/CI-Deconvolve.txt`.
+- **FluoResFM** inference architecture adapted from
+  [napari-fluoresfm, commit 2fded7c](https://github.com/qiqi-lu/napari-fluoresfm/tree/2fded7c31be8c52476de89934ced9093ebe2c307)
+  (Qiqi Lu, MIT). The architecture builds on the [LabML implementation](https://github.com/labmlai/annotated_deep_learning_paper_implementations)
+  (MIT). See `licenses/FluoResFM.txt` and `licenses/LabML.txt`.
+  The user-installed checkpoint comes from the [FluoResFM authors](https://github.com/qiqi-lu/fluoresfm).
+  Text conditioning uses Microsoft's [BiomedCLIP](https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224)
+  weights and BiomedBERT tokenizer fetched separately.

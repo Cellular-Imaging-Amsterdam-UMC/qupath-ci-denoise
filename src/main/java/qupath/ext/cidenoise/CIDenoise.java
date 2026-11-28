@@ -28,6 +28,8 @@ import java.util.function.BooleanSupplier;
 public final class CIDenoise {
     public static final int DEFAULT_TILE = 512;
     public static final int DEFAULT_OVERLAP = 128;
+    static final int FLUORESFM_TILE = 64;
+    static final int FLUORESFM_OVERLAP = 16;
     private static final int EXPORT_TILE = 512;
     private static final Logger logger = LoggerFactory.getLogger(CIDenoise.class);
 
@@ -66,20 +68,61 @@ public final class CIDenoise {
         }
     }
 
+    public enum Model {
+        NOISE2NOISE_FMD("Noise2Noise-FMD", "_denoise"),
+        FLUORESFM("FluoResFM (deconvolution)", "_fluoresfm");
+
+        private final String label;
+        private final String suffix;
+
+        Model(String label, String suffix) {
+            this.label = label;
+            this.suffix = suffix;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    public record FluoResFMSettings(Path directory, String imageContext) {
+        public FluoResFMSettings {
+            Objects.requireNonNull(directory);
+            Objects.requireNonNull(imageContext);
+        }
+    }
+
     public record Options(Format format, boolean maxZ, int tileSize, int overlap, List<Integer> channels,
-                          Device device, Path pythonExecutable) {
+                          Device device, Path pythonExecutable, Model model, int strength, FluoResFMSettings fluoResFM) {
         public Options(Format format, boolean maxZ, int tileSize, int overlap, List<Integer> channels) {
             this(format, maxZ, tileSize, overlap, channels, Device.CPU, null);
+        }
+
+        public Options(Format format, boolean maxZ, int tileSize, int overlap, List<Integer> channels,
+                       Device device, Path pythonExecutable) {
+            this(format, maxZ, tileSize, overlap, channels, device, pythonExecutable, Model.NOISE2NOISE_FMD, 100, null);
         }
 
         public Options {
             Objects.requireNonNull(format);
             Objects.requireNonNull(device);
+            Objects.requireNonNull(model);
             channels = List.copyOf(channels);
             if (tileSize < 64 || tileSize > 512 || tileSize % 32 != 0 || overlap < 0 || overlap >= tileSize)
                 throw new IllegalArgumentException("Tile size must be a multiple of 32 from 64 to 512, with overlap smaller than the tile.");
             if (channels.stream().anyMatch(channel -> channel < 0))
                 throw new IllegalArgumentException("Channel indices must be zero-based.");
+            if (strength < 0 || strength > 100)
+                throw new IllegalArgumentException("Denoising strength must be from 0 to 100%.");
+            if (model == Model.FLUORESFM && strength > 0) {
+                if (device == Device.CPU)
+                    throw new IllegalArgumentException("FluoResFM requires NVIDIA CUDA.");
+                if (fluoResFM == null)
+                    throw new IllegalArgumentException("Choose a FluoResFM model folder.");
+                if (tileSize != FLUORESFM_TILE || overlap != FLUORESFM_OVERLAP)
+                    throw new IllegalArgumentException("FluoResFM uses 64-pixel tiles with 16 pixels of overlap.");
+            }
         }
 
         /** An empty channel list selects all channels. */
@@ -136,14 +179,18 @@ public final class CIDenoise {
         var work = new RunProgress(plans.stream().mapToLong(RegionPlan::work).sum(), progress);
         Files.createDirectories(directory);
         var results = new java.util.ArrayList<Path>();
-        work.advance(0, "Loading Noise2Noise-FMD…");
-        try (var model = openModel(options.tileSize(), options.device(), options.pythonExecutable(), cancelled)) {
-            logger.info("Noise2Noise-FMD inference on {}", model.deviceName());
+        boolean copying = options.strength() == 0;
+        work.advance(0, copying ? "Preparing to copy original pixels…" : "Loading " + options.model() + "…");
+        try (var model = copying ? null : openModel(source, options, cancelled)) {
+            String processingDevice = copying ? "Original pixels" : model.deviceName();
+            if (!copying)
+                logger.info("{} inference on {}", options.model(), processingDevice);
             for (int index = 0; index < regions.size(); index++) {
                 checkCancelled(cancelled);
                 var region = regions.get(index);
                 var plan = plans.get(index);
-                String basename = safeName(region.name) + (options.maxZ ? "_denoise_maxZ" : "_denoise");
+                String suffix = copying ? "_copy" : options.model().suffix;
+                String basename = safeName(region.name) + suffix + (options.maxZ ? "_maxZ" : "");
                 var scratch = Files.createTempDirectory(directory, ".cidenoise-");
                 try {
                     Path output;
@@ -156,7 +203,7 @@ public final class CIDenoise {
                                     String plane = String.format("%s (%d/%d)  •  T %d/%d  •  Z %d/%d  •  Channel %d/%d  •  %s%n",
                                             region.name, index + 1, regions.size(),
                                             t + 1, source.nTimepoints(), z + 1, source.nZSlices(), c + 1, source.nChannels(),
-                                            model.deviceName());
+                                            processingDevice);
                                     processor.process(z, t, c, (phase, count, total, advance) -> work.advance(advance,
                                             plane + phase + (total == 0 ? "" : " tile " + count + " / " + total)));
                                 }
@@ -180,10 +227,10 @@ public final class CIDenoise {
     }
 
     public static String validateModel(Device device, Path pythonExecutable) throws IOException {
-        try (var model = openModel(64, device, pythonExecutable, () -> false)) {
+        try (var model = openNoise2Noise(64, device, pythonExecutable, () -> false)) {
             var pixels = new float[64 * 64];
             Arrays.fill(pixels, -0.25f);
-            model.predict(pixels);
+            model.predict(pixels, 0);
             for (float pixel : pixels) {
                 if (!Float.isFinite(pixel))
                     throw new IOException("Noise2Noise-FMD returned non-finite values.");
@@ -192,7 +239,54 @@ public final class CIDenoise {
         }
     }
 
-    private static TilePredictor openModel(int tile, Device device, Path python, BooleanSupplier cancelled)
+    private static TilePredictor openModel(ImageServer<?> source, Options options, BooleanSupplier cancelled)
+            throws IOException {
+        if (options.model() == Model.NOISE2NOISE_FMD)
+            return openNoise2Noise(options.tileSize(), options.device(), options.pythonExecutable(), cancelled);
+        Path python = options.pythonExecutable() == null ? bundledPython() : options.pythonExecutable();
+        if (python == null)
+            throw new IOException("Select a Python executable with CUDA-enabled PyTorch and Transformers in Advanced settings.");
+        var settings = options.fluoResFM();
+        validateFluoResFMFolder(settings.directory());
+        var prompts = java.util.stream.IntStream.range(0, source.nChannels())
+                .mapToObj(channel -> fluoResFMPrompt(source, channel, settings.imageContext()))
+                .toList();
+        return PythonTilePredictor.fluoResFM(options.tileSize(), python, settings.directory(), prompts, cancelled);
+    }
+
+    private static String fluoResFMPrompt(ImageServer<?> source, int channel, String context) {
+        var prompt = new StringBuilder("Task: deconvolution");
+        if (!context.isBlank())
+            prompt.append("; ").append(context.strip());
+        String channelName = source.getChannel(channel).getName();
+        if (channelName != null && !channelName.isBlank() && !channelName.matches("(?i)channel ?\\d+"))
+            prompt.append("; imaging channel: ").append(channelName);
+        var cal = source.getPixelCalibration();
+        if (cal.hasPixelSizeMicrons()) {
+            String size = String.format(java.util.Locale.ROOT, "%.4g x %.4g nm",
+                    cal.getPixelWidthMicrons() * 1_000, cal.getPixelHeightMicrons() * 1_000);
+            prompt.append("; input pixel size: ").append(size).append("; target pixel size: ").append(size);
+        }
+        return prompt.toString();
+    }
+
+    static void validateFluoResFMFolder(Path directory) {
+        for (String file : List.of("epoch_0_iter_700000.pt", "open_clip_pytorch_model.bin",
+                "tokenizer/config.json", "tokenizer/tokenizer_config.json", "tokenizer/vocab.txt")) {
+            if (!Files.isRegularFile(directory.resolve(file)) || !Files.isReadable(directory.resolve(file)))
+                throw new IllegalArgumentException("Missing FluoResFM file: " + directory.resolve(file));
+        }
+    }
+
+    static Path bundledFluoResFM() {
+        String override = System.getenv("QUPATH_FLUORESFM_MODELS");
+        if (override != null && !override.isBlank())
+            return Path.of(override);
+        String base = System.getenv("QUPATH_BASE");
+        return base == null || base.isBlank() ? null : Path.of(base, "models", "fluoresfm");
+    }
+
+    private static TilePredictor openNoise2Noise(int tile, Device device, Path python, BooleanSupplier cancelled)
             throws IOException {
         if (device == Device.CPU)
             return new Noise2Noise(tile);
@@ -202,7 +296,7 @@ public final class CIDenoise {
             throw new IOException("Select a Python executable with CUDA-enabled PyTorch in Advanced settings.");
         if (python != null) {
             try {
-                return new CudaNoise2Noise(tile, python, cancelled);
+                return PythonTilePredictor.noise2Noise(tile, python, cancelled);
             } catch (IOException e) {
                 if (device == Device.CUDA)
                     throw e;

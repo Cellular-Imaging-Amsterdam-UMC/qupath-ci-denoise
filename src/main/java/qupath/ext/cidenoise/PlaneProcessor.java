@@ -56,7 +56,7 @@ final class PlaneProcessor {
     }
 
     static boolean denoisesChannel(CIDenoise.Options options, int channel) {
-        return options.channels().isEmpty() || options.channels().contains(channel);
+        return options.strength() > 0 && (options.channels().isEmpty() || options.channels().contains(channel));
     }
 
     static long scanTiles(CIDenoise.Region crop, int tile) {
@@ -87,8 +87,10 @@ final class PlaneProcessor {
         }
 
         long done = 0;
-        float scale = range.maximum > 0 ? range.maximum : 1;
-        float low = Math.max(range.maximum, 0) * 0.5f;
+        boolean fluo = options.model() == CIDenoise.Model.FLUORESFM;
+        float scale = range.scale;
+        float low = range.offset;
+        float strength = options.strength() / 100f;
         for (int band = 0; band < rows.size(); band++) {
             int y = rows.get(band);
             int height = Math.min(tile, crop.height() - y);
@@ -97,21 +99,29 @@ final class PlaneProcessor {
                 var samples = read(x, y, width, height, z, t, c);
                 for (int j = 0; j < tile; j++) {
                     int from = reflected(j, height) * width;
-                    for (int i = 0; i < tile; i++)
-                        patch[j * tile + i] = (samples[from + reflected(i, width)] - low) / scale;
+                    for (int i = 0; i < tile; i++) {
+                        float input = samples[from + reflected(i, width)];
+                        if (fluo)
+                            input = Math.max(0, input);
+                        patch[j * tile + i] = (input - low) / scale;
+                    }
                 }
-                model.predict(patch);
+                model.predict(patch, c);
                 CIDenoise.checkCancelled(cancelled);
                 for (int j = 0; j < height; j++) {
                     var row = stripe[(y + j) % stripe.length];
                     for (int i = 0; i < width; i++) {
                         float value = patch[j * tile + i];
                         if (!Float.isFinite(value))
-                            throw new IOException("Noise2Noise-FMD returned non-finite values.");
+                            throw new IOException(options.model() + " returned non-finite values.");
+                        if (strength < 1) {
+                            float original = (samples[j * width + i] - low) / scale;
+                            value = strength * value + (1 - strength) * original;
+                        }
                         row[x + i] += value * (ramp[j] * ramp[i]);
                     }
                 }
-                progress.update("Denoising", ++done, total, 1);
+                progress.update(fluo ? "Restoring" : "Denoising", ++done, total, 1);
             }
 
             // Later tile rows cannot contribute to these scanlines.
@@ -132,10 +142,17 @@ final class PlaneProcessor {
         long done = 0;
         float min = Float.POSITIVE_INFINITY;
         float max = Float.NEGATIVE_INFINITY;
+        // Share normalization across all tiles in the plane so overlapping predictions use the same scale.
+        int stride = Math.max(1, (int) Math.ceil(Math.sqrt((double) crop.width() * crop.height() / 262_144)));
+        float[] sampled = options.model() == CIDenoise.Model.FLUORESFM
+                ? new float[Math.multiplyExact(Math.ceilDiv(crop.width(), stride), Math.ceilDiv(crop.height(), stride))]
+                : null;
+        int sampleCount = 0;
         for (int y = 0; y < crop.height(); y += tile) {
             int height = Math.min(tile, crop.height() - y);
             for (int x = 0; x < crop.width(); x += tile) {
-                var values = read(x, y, Math.min(tile, crop.width() - x), height, z, t, c);
+                int width = Math.min(tile, crop.width() - x);
+                var values = read(x, y, width, height, z, t, c);
                 for (float value : values) {
                     if (!Float.isFinite(value))
                         throw new IOException("Input contains non-finite values in channel " + (c + 1)
@@ -143,10 +160,29 @@ final class PlaneProcessor {
                     min = Math.min(min, value);
                     max = Math.max(max, value);
                 }
+                if (sampled != null) {
+                    for (int j = (stride - y % stride) % stride; j < height; j += stride) {
+                        for (int i = (stride - x % stride) % stride; i < width; i += stride)
+                            sampled[sampleCount++] = Math.max(0, values[j * width + i]);
+                    }
+                }
                 progress.update("Scanning intensity", ++done, total, 1);
             }
         }
-        return new Range(min, max);
+        if (sampled == null)
+            return new Range(min, max, Math.max(max, 0) * 0.5f, max > 0 ? max : 1);
+        Arrays.sort(sampled, 0, sampleCount);
+        float low = percentile(sampled, sampleCount, 0.03);
+        float high = percentile(sampled, sampleCount, 0.995);
+        if (high == 0)
+            high = Math.max(0, max);
+        return new Range(min, max, low, high > low ? high - low : 1);
+    }
+
+    private static float percentile(float[] sorted, int count, double fraction) {
+        double index = (count - 1) * fraction;
+        int below = (int) index;
+        return (float) (sorted[below] + (index - below) * (sorted[Math.min(count - 1, below + 1)] - sorted[below]));
     }
 
     private void copyPlane(int z, int t, int c, TileProgress progress) throws IOException {
@@ -225,5 +261,5 @@ final class PlaneProcessor {
         return weights;
     }
 
-    private record Range(float minimum, float maximum) {}
+    private record Range(float minimum, float maximum, float offset, float scale) {}
 }
